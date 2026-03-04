@@ -1,0 +1,13 @@
+[core]
+obsidian_vault = "~/Library/Mobile Documents/com~apple~CloudDocs/Shared/Work Obsidian"
+projects_folder = "Projects"
+sandbox_root = "~/Projects/work"
+branch_prefix = "ehutt"
+
+[github]
+user = "ehutt"
+repo = "Arize-ai/phoenix"
+
+[agent]
+test_cmd = "uv run pytest -x"
+lint_cmd = "ruff check && ruff format --check"
