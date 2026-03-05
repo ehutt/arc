@@ -270,8 +270,6 @@ def load_projects(cfg: Config) -> list[Project]:
     if not projects_dir.exists():
         return []
     projects = []
-    seen_slugs: set[str] = set()
-    # Folder-per-project: {slug}/index.md
     for d in sorted(projects_dir.iterdir()):
         if d.is_dir() and not d.name.startswith("."):
             index = d / "index.md"
@@ -279,12 +277,6 @@ def load_projects(cfg: Config) -> list[Project]:
                 p = parse_project(index)
                 if p:
                     projects.append(p)
-                    seen_slugs.add(p.slug)
-    # Single-file: {slug}.md
-    for f in sorted(projects_dir.glob("*.md")):
-        p = parse_project(f)
-        if p and p.slug not in seen_slugs:
-            projects.append(p)
     return projects
 
 
@@ -299,14 +291,12 @@ def find_project(cfg: Config, slug: str) -> Project:
 def complete_project(incomplete: str) -> list[str]:
     try:
         cfg = load_config()
-        slugs: set[str] = set()
-        for d in cfg.projects_dir.iterdir():
-            if d.is_dir() and not d.name.startswith(".") and (d / "index.md").exists():
-                if d.name.startswith(incomplete):
-                    slugs.add(d.name)
-        for p in cfg.projects_dir.glob("*.md"):
-            if p.stem.startswith(incomplete):
-                slugs.add(p.stem)
+        slugs = [
+            d.name for d in cfg.projects_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+            and (d / "index.md").exists()
+            and d.name.startswith(incomplete)
+        ]
         return sorted(slugs)
     except Exception:
         return []
@@ -326,14 +316,11 @@ def update_project_note(project: Project) -> None:
 
 
 def create_project_note(cfg: Config, title: str, slug: str, body: str = "",
-                        github_issue: str = "", folder: bool = False) -> Project:
+                        github_issue: str = "") -> Project:
     today = datetime.now().strftime("%Y-%m-%d")
-    if folder:
-        project_dir = cfg.projects_dir / slug
-        project_dir.mkdir(parents=True, exist_ok=True)
-        note_path = project_dir / "index.md"
-    else:
-        note_path = cfg.projects_dir / f"{slug}.md"
+    project_dir = cfg.projects_dir / slug
+    project_dir.mkdir(parents=True, exist_ok=True)
+    note_path = project_dir / "index.md"
     project = Project(
         title=title,
         slug=slug,
@@ -1262,48 +1249,6 @@ p.write_text(text)
         console.print(f"[green]CI monitor launched: {sess_name}[/green]")
 
     console.print(f"\n[bold]Done![/bold] PR: {pr_url}")
-
-
-@app.command()
-def migrate():
-    """Migrate single-file projects to folder-per-project format."""
-    cfg = load_config()
-    projects_dir = cfg.projects_dir
-    migrated = 0
-
-    for f in sorted(projects_dir.glob("*.md")):
-        proj = parse_project(f)
-        if not proj:
-            continue
-
-        folder = projects_dir / proj.slug
-        if folder.exists() and (folder / "index.md").exists():
-            console.print(f"  [dim]{proj.slug}: already in folder format[/dim]")
-            continue
-
-        folder.mkdir(parents=True, exist_ok=True)
-        target = folder / "index.md"
-        f.rename(target)
-        console.print(f"  [green]{proj.slug}[/green]: {f.name} → {proj.slug}/index.md")
-        migrated += 1
-
-    # Move plans into project folders
-    plans_dir = projects_dir / "plans"
-    if plans_dir.exists():
-        for plan_file in sorted(plans_dir.glob("*.md")):
-            for d in projects_dir.iterdir():
-                if d.is_dir() and not d.name.startswith(".") and d.name != "plans":
-                    if plan_file.name.startswith(d.name):
-                        target = d / plan_file.name
-                        if not target.exists():
-                            plan_file.rename(target)
-                            console.print(f"  [green]plan[/green]: {plan_file.name} → {d.name}/{plan_file.name}")
-                        break
-
-    if migrated == 0:
-        console.print("[dim]No projects to migrate.[/dim]")
-    else:
-        console.print(f"\n[green]Migrated {migrated} project(s).[/green]")
 
 
 if __name__ == "__main__":
