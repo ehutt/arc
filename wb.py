@@ -782,128 +782,6 @@ def stage_cmd(
 
 
 @app.command()
-def run(
-    project: str = typer.Argument(autocompletion=complete_project),
-    stage_id: int = typer.Argument(None),
-):
-    """Run a stage interactively with Claude."""
-    cfg = load_config()
-    proj = find_project(cfg, project)
-
-    if not proj.stages:
-        console.print(f"[red]No stages defined for {proj.slug}. Use wb stage to add stages.[/red]")
-        raise typer.Exit(1)
-
-    if not proj.sandbox or not Path(proj.sandbox).exists():
-        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
-        raise typer.Exit(1)
-
-    # Pick stage
-    if stage_id is None:
-        stage = proj.next_available_stage()
-        if not stage:
-            console.print("[yellow]No available stages. All done or blocked.[/yellow]")
-            raise typer.Exit(0)
-        stage_id = stage.id
-    else:
-        stage = proj.get_stage(stage_id)
-
-    if not stage:
-        console.print(f"[red]Stage {stage_id} not found[/red]")
-        raise typer.Exit(1)
-
-    # Validate deps
-    done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
-    unmet = [d for d in stage.depends_on if d not in done_ids]
-    if unmet:
-        blocking = [f"{b.id} ({b.name})" for b in proj.stages if b.id in unmet]
-        console.print(f"[red]Stage {stage_id} blocked by: {', '.join(blocking)}[/red]")
-        raise typer.Exit(1)
-
-    if stage.status == "done":
-        if not typer.confirm(f"Stage {stage_id} is done. Re-run?", default=False):
-            raise typer.Exit(0)
-        stage.status = "pending"
-
-    if stage.status == "running":
-        if not typer.confirm(f"Stage {stage_id} is marked running. Re-run?", default=True):
-            raise typer.Exit(0)
-
-    # Update stage status
-    stage.status = "running"
-    update_project_note(proj)
-
-    sandbox_path = Path(proj.sandbox)
-
-    # Build system prompt from stage plan
-    plan_content = ""
-    if stage.plan and proj.folder:
-        plan_path = proj.folder / stage.plan
-        if plan_path.exists():
-            plan_content = plan_path.read_text()
-
-    system_prompt = textwrap.dedent(f"""\
-        You are working on stage {stage.id} of project: {proj.title}
-
-        Stage: {stage.name}
-
-        {plan_content if plan_content else "No plan file found. Ask the user what to do."}
-
-        Project sandbox: {sandbox_path}
-        Branch: {proj.branch}
-
-        When you've completed all steps, tell the user.
-    """)
-
-    console.print(f"[bold]Running stage {stage.id}: {stage.name}[/bold]")
-    console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
-
-    initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
-    subprocess.run(
-        ["claude", "--dangerously-skip-permissions",
-         "--system-prompt", system_prompt,
-         initial_msg],
-        cwd=sandbox_path,
-    )
-
-    # Post-exit prompt
-    console.print()
-    choice = input(f"Mark '{stage.name}' as done? [Y/n/skip] ").strip().lower()
-
-    if choice in ("", "y", "yes"):
-        stage.status = "done"
-        update_project_note(proj)
-        console.print(f"[green]Stage {stage.id} marked done.[/green]")
-
-        # Report what's now unblocked
-        done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
-        newly_unblocked = [
-            s for s in proj.stages
-            if s.status == "pending" and all(d in done_ids for d in s.depends_on)
-        ]
-        if newly_unblocked:
-            names = [f"{s.id} ({s.name})" for s in newly_unblocked]
-            console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
-            notify("wb", f"{stage.name} done. Unblocked: {', '.join(s.name for s in newly_unblocked)}")
-        else:
-            console.print("[dim]No new stages unblocked.[/dim]")
-
-        # Check if all done
-        if all(s.status in ("done", "skipped") for s in proj.stages):
-            proj.status = "awaiting-approval"
-            update_project_note(proj)
-            console.print(f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]")
-            notify("wb", f"All stages complete for {proj.slug}")
-
-    elif choice == "skip":
-        stage.status = "skipped"
-        update_project_note(proj)
-        console.print(f"[yellow]Stage {stage.id} skipped.[/yellow]")
-    else:
-        console.print(f"[dim]Stage {stage.id} still running. Resume with: wb run {proj.slug} {stage.id}[/dim]")
-
-
-@app.command()
 def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
     """Create an isolated Phoenix sandbox for a project."""
     cfg = load_config()
@@ -951,66 +829,177 @@ def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
 
 
 @app.command()
-def implement(project: str = typer.Argument(autocompletion=complete_project)):
-    """Launch autonomous implement + review pipeline in tmux."""
+def implement(
+    project: str = typer.Argument(autocompletion=complete_project),
+    stage_id: int = typer.Argument(None),
+    bg: bool = typer.Option(False, "--bg", help="Run autonomously in background (tmux)"),
+):
+    """Implement a project or stage. Interactive by default, --bg for autonomous."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
-    # Staged project: show stage picker
-    if proj.stages:
-        console.print(f"[bold]Stages for {proj.slug}:[/bold]")
-        done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
-        available = []
-        for s in sorted(proj.stages, key=lambda x: x.id):
-            unmet = [d for d in s.depends_on if d not in done_ids]
-            blocked = len(unmet) > 0 and s.status == "pending"
-            if s.status == "pending" and not blocked:
-                status_note = "ready to run"
-                available.append(s)
-            elif blocked:
-                blocking = ", ".join(str(d) for d in unmet)
-                status_note = f"blocked by {blocking}"
-            else:
-                status_note = s.status
-            console.print(f"  {s.id}. {s.name} [{s.status}] — {status_note}")
-
-        if not available:
-            console.print("\n[yellow]No stages ready to run.[/yellow]")
-            raise typer.Exit(0)
-
-        console.print()
-        ids = "/".join(str(s.id) for s in available)
-        choice = input(f"Run which stage? [{ids}/all-unblocked]: ").strip()
-
-        if choice == "all-unblocked":
-            console.print("[dim]Running stages sequentially...[/dim]")
-            for s in available:
-                console.print(f"\n[bold]Running stage {s.id}: {s.name}[/bold]")
-                subprocess.run(
-                    [sys.executable, __file__, "run", proj.slug, str(s.id)],
-                )
-        elif choice.isdigit():
-            os.execvp(sys.executable, [sys.executable, __file__, "run", proj.slug, choice])
-        else:
-            console.print("[dim]Cancelled.[/dim]")
-        return
-
-    # Non-staged project: original linear pipeline
-    if proj.status not in ("ready", "needs-plan"):
-        if proj.status in ("implementing", "reviewing"):
-            console.print(f"[yellow]Project is already {proj.status}.[/yellow]")
-            sess = f"wb-{proj.slug}"
-            if tmux_session_exists(sess):
-                console.print(f"Attach with: [bold]tmux attach -t {sess}[/bold]")
-            raise typer.Exit(0)
-        console.print(f"[red]Project status is '{proj.status}', expected 'ready'[/red]")
-        raise typer.Exit(1)
-
     if not proj.sandbox or not Path(proj.sandbox).exists():
-        console.print("[red]No sandbox found. Run [bold]wb sandbox {project}[/bold] first.[/red]")
+        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
         raise typer.Exit(1)
 
     sandbox_path = Path(proj.sandbox)
+
+    # --- Background mode: autonomous implement → review pipeline in tmux ---
+    if bg:
+        _implement_bg(cfg, proj, sandbox_path)
+        return
+
+    # --- Interactive mode (default) ---
+    if proj.stages:
+        _implement_interactive_staged(cfg, proj, sandbox_path, stage_id)
+    else:
+        _implement_interactive_simple(cfg, proj, sandbox_path)
+
+
+def _implement_interactive_staged(cfg: Config, proj: Project, sandbox_path: Path,
+                                  stage_id: int | None) -> None:
+    """Interactive implementation of a single stage."""
+    # Pick stage
+    if stage_id is None:
+        stage = proj.next_available_stage()
+        if not stage:
+            console.print("[yellow]No available stages. All done or blocked.[/yellow]")
+            raise typer.Exit(0)
+        stage_id = stage.id
+    else:
+        stage = proj.get_stage(stage_id)
+
+    if not stage:
+        console.print(f"[red]Stage {stage_id} not found[/red]")
+        raise typer.Exit(1)
+
+    # Validate deps
+    done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
+    unmet = [d for d in stage.depends_on if d not in done_ids]
+    if unmet:
+        blocking = [f"{b.id} ({b.name})" for b in proj.stages if b.id in unmet]
+        console.print(f"[red]Stage {stage_id} blocked by: {', '.join(blocking)}[/red]")
+        raise typer.Exit(1)
+
+    if stage.status == "done":
+        if not typer.confirm(f"Stage {stage_id} is done. Re-run?", default=False):
+            raise typer.Exit(0)
+        stage.status = "pending"
+
+    if stage.status == "running":
+        if not typer.confirm(f"Stage {stage_id} is marked running. Re-run?", default=True):
+            raise typer.Exit(0)
+
+    # Update stage status
+    stage.status = "running"
+    update_project_note(proj)
+
+    # Build system prompt from stage plan
+    plan_content = ""
+    if stage.plan and proj.folder:
+        plan_path = proj.folder / stage.plan
+        if plan_path.exists():
+            plan_content = plan_path.read_text()
+
+    system_prompt = textwrap.dedent(f"""\
+        You are working on stage {stage.id} of project: {proj.title}
+
+        Stage: {stage.name}
+
+        {plan_content if plan_content else "No plan file found. Ask the user what to do."}
+
+        Project sandbox: {sandbox_path}
+        Branch: {proj.branch}
+
+        When you've completed all steps, tell the user.
+    """)
+
+    console.print(f"[bold]Implementing stage {stage.id}: {stage.name}[/bold]")
+    console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
+
+    initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
+    subprocess.run(
+        ["claude", "--dangerously-skip-permissions",
+         "--system-prompt", system_prompt,
+         initial_msg],
+        cwd=sandbox_path,
+    )
+
+    # Post-exit prompt
+    console.print()
+    choice = input(f"Mark '{stage.name}' as done? [Y/n/skip] ").strip().lower()
+
+    if choice in ("", "y", "yes"):
+        stage.status = "done"
+        update_project_note(proj)
+        console.print(f"[green]Stage {stage.id} marked done.[/green]")
+
+        done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
+        newly_unblocked = [
+            s for s in proj.stages
+            if s.status == "pending" and all(d in done_ids for d in s.depends_on)
+        ]
+        if newly_unblocked:
+            names = [f"{s.id} ({s.name})" for s in newly_unblocked]
+            console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
+            notify("wb", f"{stage.name} done. Unblocked: {', '.join(s.name for s in newly_unblocked)}")
+        else:
+            console.print("[dim]No new stages unblocked.[/dim]")
+
+        if all(s.status in ("done", "skipped") for s in proj.stages):
+            proj.status = "awaiting-approval"
+            update_project_note(proj)
+            console.print(f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]")
+            notify("wb", f"All stages complete for {proj.slug}")
+
+    elif choice == "skip":
+        stage.status = "skipped"
+        update_project_note(proj)
+        console.print(f"[yellow]Stage {stage.id} skipped.[/yellow]")
+    else:
+        console.print(f"[dim]Stage {stage.id} still running. Resume with: wb implement {proj.slug} {stage.id}[/dim]")
+
+
+def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path) -> None:
+    """Interactive implementation for non-staged projects."""
+    note_content = proj.path.read_text() if proj.path else ""
+
+    system_prompt = textwrap.dedent(f"""\
+        You are working on project: {proj.title}
+
+        {note_content}
+
+        Project sandbox: {sandbox_path}
+        Branch: {proj.branch}
+
+        When you've completed all tasks, tell the user.
+    """)
+
+    proj.status = "implementing"
+    update_project_note(proj)
+
+    console.print(f"[bold]Implementing: {proj.title}[/bold]")
+    console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
+
+    subprocess.run(
+        ["claude", "--dangerously-skip-permissions",
+         "--system-prompt", system_prompt,
+         f"Let's implement {proj.title}."],
+        cwd=sandbox_path,
+    )
+
+    console.print()
+    choice = input("Mark project as awaiting-approval? [Y/n] ").strip().lower()
+    if choice in ("", "y", "yes"):
+        proj.status = "awaiting-approval"
+        update_project_note(proj)
+        console.print(f"[green]Ready for approval. Run: wb approve {proj.slug}[/green]")
+    else:
+        console.print(f"[dim]Project still implementing. Re-run: wb implement {proj.slug}[/dim]")
+
+
+def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
+    """Autonomous implement → review pipeline in tmux background."""
     note_content = proj.path.read_text() if proj.path else ""
 
     claude_md = textwrap.dedent(f"""\
