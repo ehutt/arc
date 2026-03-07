@@ -17,16 +17,48 @@ import socket
 import subprocess
 import sys
 import textwrap
-from urllib.parse import quote
-import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
+import tomllib
 import typer
 import yaml
 from rich.console import Console
 from rich.table import Table
+
+
+def _clean_env() -> dict[str, str]:
+    """Return a copy of os.environ with conda/virtualenv vars stripped.
+
+    This prevents agent subprocesses (Claude, Codex) from inheriting the
+    host's Python environment, which can cause mypy/pytest to resolve
+    packages from the wrong site-packages (e.g. miniconda3 instead of
+    the sandbox's .venv).
+    """
+    env = os.environ.copy()
+    # Remove conda environment variables
+    for key in list(env):
+        if key.startswith(("CONDA_", "_CE_")):
+            del env[key]
+    # Remove virtualenv / venv activation vars
+    for key in ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT"):
+        env.pop(key, None)
+    # Strip conda/venv paths from PATH
+    if "PATH" in env:
+        paths = env["PATH"].split(os.pathsep)
+        paths = [
+            p
+            for p in paths
+            if "miniconda" not in p
+            and "anaconda" not in p
+            and "conda" not in p.split(os.sep)
+            and ".venv" not in p.split(os.sep)
+        ]
+        env["PATH"] = os.pathsep.join(paths)
+    return env
+
 
 app = typer.Typer(invoke_without_command=True, no_args_is_help=False)
 console = Console()
@@ -54,6 +86,7 @@ STATUS_COLORS = {
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Config:
@@ -98,12 +131,13 @@ def load_config() -> Config:
 # Stage + Project dataclasses + frontmatter
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Stage:
     id: int
     name: str
     status: str = "pending"  # pending | running | done | skipped
-    plan: str = ""           # relative path within project folder
+    plan: str = ""  # relative path within project folder
     depends_on: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -204,7 +238,8 @@ class Project:
     def unblocked_stages(self) -> list[Stage]:
         done_ids = {s.id for s in self.stages if s.status in ("done", "skipped")}
         return [
-            s for s in self.stages
+            s
+            for s in self.stages
             if s.status == "pending" and all(d in done_ids for d in s.depends_on)
         ]
 
@@ -246,13 +281,15 @@ def parse_project(path: Path) -> Project | None:
     stages = []
     for raw_stage in fm.get("stages", []):
         if isinstance(raw_stage, dict):
-            stages.append(Stage(
-                id=raw_stage.get("id", 0),
-                name=raw_stage.get("name", ""),
-                status=raw_stage.get("status", "pending"),
-                plan=raw_stage.get("plan", ""),
-                depends_on=raw_stage.get("depends_on", []),
-            ))
+            stages.append(
+                Stage(
+                    id=raw_stage.get("id", 0),
+                    name=raw_stage.get("name", ""),
+                    status=raw_stage.get("status", "pending"),
+                    plan=raw_stage.get("plan", ""),
+                    depends_on=raw_stage.get("depends_on", []),
+                )
+            )
     return Project(
         title=fm.get("title", path.stem),
         slug=fm["slug"],
@@ -301,8 +338,10 @@ def complete_project(incomplete: str) -> list[str]:
     try:
         cfg = load_config()
         slugs = [
-            d.name for d in cfg.projects_dir.iterdir()
-            if d.is_dir() and not d.name.startswith(".")
+            d.name
+            for d in cfg.projects_dir.iterdir()
+            if d.is_dir()
+            and not d.name.startswith(".")
             and (d / "index.md").exists()
             and d.name.startswith(incomplete)
         ]
@@ -316,7 +355,7 @@ def update_project_note(project: Project) -> None:
         return
     text = project.path.read_text()
     m = re.match(r"^---\n.+?\n---\n?", text, re.DOTALL)
-    body = text[m.end():] if m else text
+    body = text[m.end() :] if m else text
     project.updated = datetime.now().strftime("%Y-%m-%d")
     if project.stages:
         project.status = derive_project_status(project.stages)
@@ -324,8 +363,9 @@ def update_project_note(project: Project) -> None:
     project.path.write_text(f"---\n{fm}---\n{body}")
 
 
-def create_project_note(cfg: Config, title: str, slug: str, body: str = "",
-                        github_issue: str = "") -> Project:
+def create_project_note(
+    cfg: Config, title: str, slug: str, body: str = "", github_issue: str = ""
+) -> Project:
     today = datetime.now().strftime("%Y-%m-%d")
     project_dir = cfg.projects_dir / slug
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +384,7 @@ def create_project_note(cfg: Config, title: str, slug: str, body: str = "",
     note_body = textwrap.dedent(f"""\
 
     ## Objective
-    {body or '(to be filled during wb plan)'}
+    {body or "(to be filled during wb plan)"}
 
     ## Tasks
     (filled during wb plan)
@@ -354,7 +394,7 @@ def create_project_note(cfg: Config, title: str, slug: str, body: str = "",
 
     ## Notes
     ### {today}
-    - Created{f' from issue {github_issue}' if github_issue else ''}
+    - Created{f" from issue {github_issue}" if github_issue else ""}
     """)
     note_path.write_text(f"---\n{fm}---\n{note_body}")
     return project
@@ -371,6 +411,7 @@ def slugify(text: str) -> str:
 # tmux helpers
 # ---------------------------------------------------------------------------
 
+
 def tmux_session_exists(name: str) -> bool:
     result = subprocess.run(
         ["tmux", "has-session", "-t", name],
@@ -382,7 +423,8 @@ def tmux_session_exists(name: str) -> bool:
 def tmux_sessions() -> list[str]:
     result = subprocess.run(
         ["tmux", "list-sessions", "-F", "#{session_name}"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         return []
@@ -403,16 +445,21 @@ def next_free_port(start: int = 6006) -> int:
 
 
 def notify(title: str, message: str) -> None:
-    subprocess.run([
-        "osascript", "-e",
-        f'display notification "{message}" with title "{title}"',
-    ], capture_output=True)
+    subprocess.run(
+        [
+            "osascript",
+            "-e",
+            f'display notification "{message}" with title "{title}"',
+        ],
+        capture_output=True,
+    )
     print("\a", end="", flush=True)
 
 
 # ---------------------------------------------------------------------------
 # time helpers
 # ---------------------------------------------------------------------------
+
 
 def relative_time(date_str: str) -> str:
     if not date_str:
@@ -433,6 +480,7 @@ def relative_time(date_str: str) -> str:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
 
 @app.callback()
 def dashboard(ctx: typer.Context):
@@ -457,10 +505,12 @@ def dashboard(ctx: typer.Context):
     table.add_column("Updated", justify="right")
 
     status_order = {s: i for i, s in enumerate(STATUSES)}
-    projects.sort(key=lambda p: (
-        0 if p.derived_status in ("implementing", "reviewing", "awaiting-approval") else 1,
-        status_order.get(p.derived_status, 99),
-    ))
+    projects.sort(
+        key=lambda p: (
+            0 if p.derived_status in ("implementing", "reviewing", "awaiting-approval") else 1,
+            status_order.get(p.derived_status, 99),
+        )
+    )
 
     for p in projects:
         branch = p.branch
@@ -508,16 +558,28 @@ def sync():
 
     console.print("[bold]Fetching assigned issues...[/bold]")
     result = subprocess.run(
-        ["gh", "issue", "list", "--assignee", cfg.github_user,
-         "--repo", cfg.github_repo,
-         "--json", "number,title,body,labels", "--limit", "50"],
-        capture_output=True, text=True,
+        [
+            "gh",
+            "issue",
+            "list",
+            "--assignee",
+            cfg.github_user,
+            "--repo",
+            cfg.github_repo,
+            "--json",
+            "number,title,body,labels",
+            "--limit",
+            "50",
+        ],
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         console.print(f"[red]gh issue list failed: {result.stderr}[/red]")
         raise typer.Exit(1)
 
     import json
+
     issues = json.loads(result.stdout)
     console.print(f"Found {len(issues)} assigned issues.")
 
@@ -530,12 +592,15 @@ def sync():
         console.print(f"\n[bold]{issue_ref}[/bold]: {issue['title']}")
 
         options: list[tuple[str, str]] = []
-        matching = [p for p in projects if any(
-            word in p.title.lower() for word in issue["title"].lower().split()
-            if len(word) > 3
-        )]
+        matching = [
+            p
+            for p in projects
+            if any(
+                word in p.title.lower() for word in issue["title"].lower().split() if len(word) > 3
+            )
+        ]
         for p in matching:
-            options.append((f"attach to \"{p.slug}\" ({p.status})", f"attach:{p.slug}"))
+            options.append((f'attach to "{p.slug}" ({p.status})', f"attach:{p.slug}"))
         options.append(("create new project", "create"))
         options.append(("skip", "skip"))
 
@@ -573,18 +638,28 @@ def sync():
             if custom:
                 slug = custom
             body = (issue.get("body") or "")[:500]
-            proj = create_project_note(cfg, issue["title"], slug,
-                                       body=body, github_issue=issue_ref)
+            proj = create_project_note(cfg, issue["title"], slug, body=body, github_issue=issue_ref)
             projects.append(proj)
             existing_issues.add(issue_ref)
             console.print(f"  [green]Created project: {slug}[/green]")
 
     console.print("\n[bold]Checking open PRs...[/bold]")
     result = subprocess.run(
-        ["gh", "pr", "list", "--author", cfg.github_user,
-         "--repo", cfg.github_repo,
-         "--json", "number,title,url,headRefName", "--limit", "50"],
-        capture_output=True, text=True,
+        [
+            "gh",
+            "pr",
+            "list",
+            "--author",
+            cfg.github_user,
+            "--repo",
+            cfg.github_repo,
+            "--json",
+            "number,title,url,headRefName",
+            "--limit",
+            "50",
+        ],
+        capture_output=True,
+        text=True,
     )
     if result.returncode == 0:
         prs = json.loads(result.stdout)
@@ -615,7 +690,9 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     proj = find_project(cfg, project)
 
     if proj.status not in ("needs-plan", "ready"):
-        console.print(f"[yellow]Warning: project status is '{proj.status}', not 'needs-plan'[/yellow]")
+        console.print(
+            f"[yellow]Warning: project status is '{proj.status}', not 'needs-plan'[/yellow]"
+        )
         if not typer.confirm("Continue anyway?"):
             raise typer.Exit(0)
 
@@ -688,19 +765,27 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Launching planning session for: {proj.title}[/bold]")
     console.print("[dim]Chat with Claude to refine the plan. Exit when done.[/dim]\n")
 
-    os.execvp("claude", [
-        "claude", "--dangerously-skip-permissions",
-        "--permission-mode", "plan",
-        "--system-prompt", system_prompt,
-        initial_msg,
-    ])
+    os.execvp(
+        "claude",
+        [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "plan",
+            "--system-prompt",
+            system_prompt,
+            initial_msg,
+        ],
+    )
 
 
 @app.command("stage")
 def stage_cmd(
     project: str = typer.Argument(autocompletion=complete_project),
     add: str = typer.Option(None, "--add", help="Add a new stage with this name"),
-    depends_on: str = typer.Option(None, "--depends-on", help="Comma-separated stage IDs this depends on"),
+    depends_on: str = typer.Option(
+        None, "--depends-on", help="Comma-separated stage IDs this depends on"
+    ),
     plan_stage: int = typer.Option(None, "--plan", help="Launch Claude planning for this stage ID"),
 ):
     """Manage stages for a project."""
@@ -733,7 +818,9 @@ def stage_cmd(
             console.print(f"[red]Stage {plan_stage} not found[/red]")
             raise typer.Exit(1)
         if not proj.is_folder:
-            console.print("[red]Stage planning requires folder-per-project format. Run: wb migrate[/red]")
+            console.print(
+                "[red]Stage planning requires folder-per-project format. Run: wb migrate[/red]"
+            )
             raise typer.Exit(1)
 
         plan_path = proj.folder / s.plan
@@ -759,18 +846,24 @@ def stage_cmd(
         initial_msg = f"Read the project note at {proj.path} and let's plan stage {s.id}: {s.name}"
 
         console.print(f"[bold]Planning stage {s.id}: {s.name}[/bold]")
-        os.execvp("claude", [
-            "claude", "--dangerously-skip-permissions",
-            "--permission-mode", "plan",
-            "--system-prompt", system_prompt,
-            initial_msg,
-        ])
+        os.execvp(
+            "claude",
+            [
+                "claude",
+                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "plan",
+                "--system-prompt",
+                system_prompt,
+                initial_msg,
+            ],
+        )
         return
 
     # Default: list stages
     if not proj.stages:
         console.print(f"[dim]No stages defined for {proj.slug}.[/dim]")
-        console.print(f"Add with: [bold]wb stage {proj.slug} --add \"Stage name\"[/bold]")
+        console.print(f'Add with: [bold]wb stage {proj.slug} --add "Stage name"[/bold]')
         return
 
     done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
@@ -827,7 +920,9 @@ def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
 
     bare = cfg.bare_repo
     if not bare.exists():
-        console.print("[bold]Creating bare reference repo (first time, may take a minute)...[/bold]")
+        console.print(
+            "[bold]Creating bare reference repo (first time, may take a minute)...[/bold]"
+        )
         subprocess.run(
             ["git", "clone", "--bare", f"https://github.com/{cfg.github_repo}.git", str(bare)],
             check=True,
@@ -838,14 +933,30 @@ def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
 
     console.print(f"[bold]Cloning to {sandbox_path}...[/bold]")
     subprocess.run(
-        ["git", "clone", "--reference", str(bare), "--shared",
-         f"https://github.com/{cfg.github_repo}.git", str(sandbox_path)],
+        [
+            "git",
+            "clone",
+            "--reference",
+            str(bare),
+            "--shared",
+            f"https://github.com/{cfg.github_repo}.git",
+            str(sandbox_path),
+        ],
         check=True,
     )
 
     subprocess.run(
         ["git", "checkout", "-b", branch_name],
-        cwd=sandbox_path, check=True,
+        cwd=sandbox_path,
+        check=True,
+    )
+
+    # Set up Python environment
+    console.print("[dim]Running uv sync --python 3.10...[/dim]")
+    subprocess.run(
+        ["uv", "sync", "--python", "3.10"],
+        cwd=sandbox_path,
+        check=False,
     )
 
     proj.sandbox = str(sandbox_path)
@@ -887,8 +998,7 @@ def implement(
 CODEX_MODEL = "gpt-5.3-codex"
 
 
-def _codex_review(cfg: Config, proj: Project, sandbox_path: Path,
-                  stage_context: str = "") -> None:
+def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context: str = "") -> None:
     """Run code review with Codex (gpt-5.3-codex) after Claude implementation."""
     console.print()
     console.print("[bold cyan]Starting Codex code review...[/bold cyan]")
@@ -930,11 +1040,17 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path,
     """)
 
     subprocess.run(
-        ["codex", "exec",
-         "--dangerously-bypass-approvals-and-sandbox",
-         "-m", CODEX_MODEL,
-         "-C", str(sandbox_path),
-         review_prompt],
+        [
+            "codex",
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            CODEX_MODEL,
+            "-C",
+            str(sandbox_path),
+            review_prompt,
+        ],
+        env=_clean_env(),
     )
 
     console.print("[green]Codex review complete.[/green]")
@@ -944,8 +1060,9 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path,
     notify("wb", f"Implementation + Codex review complete for {proj.slug}")
 
 
-def _implement_interactive_staged(cfg: Config, proj: Project, sandbox_path: Path,
-                                  stage_id: int | None) -> None:
+def _implement_interactive_staged(
+    cfg: Config, proj: Project, sandbox_path: Path, stage_id: int | None
+) -> None:
     """Interactive implementation of a single stage."""
     # Pick stage
     if stage_id is None:
@@ -1007,10 +1124,9 @@ def _implement_interactive_staged(cfg: Config, proj: Project, sandbox_path: Path
 
     initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
     subprocess.run(
-        ["claude", "--dangerously-skip-permissions",
-         "--system-prompt", system_prompt,
-         initial_msg],
+        ["claude", "--dangerously-skip-permissions", "--system-prompt", system_prompt, initial_msg],
         cwd=sandbox_path,
+        env=_clean_env(),
     )
 
     # Codex review with stage context
@@ -1030,20 +1146,25 @@ def _implement_interactive_staged(cfg: Config, proj: Project, sandbox_path: Path
 
         done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
         newly_unblocked = [
-            s for s in proj.stages
+            s
+            for s in proj.stages
             if s.status == "pending" and all(d in done_ids for d in s.depends_on)
         ]
         if newly_unblocked:
             names = [f"{s.id} ({s.name})" for s in newly_unblocked]
             console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
-            notify("wb", f"{stage.name} done. Unblocked: {', '.join(s.name for s in newly_unblocked)}")
+            notify(
+                "wb", f"{stage.name} done. Unblocked: {', '.join(s.name for s in newly_unblocked)}"
+            )
         else:
             console.print("[dim]No new stages unblocked.[/dim]")
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
             proj.status = "awaiting-approval"
             update_project_note(proj)
-            console.print(f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]")
+            console.print(
+                f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]"
+            )
             notify("wb", f"All stages complete for {proj.slug}")
 
     elif choice == "skip":
@@ -1051,7 +1172,9 @@ def _implement_interactive_staged(cfg: Config, proj: Project, sandbox_path: Path
         update_project_note(proj)
         console.print(f"[yellow]Stage {stage.id} skipped.[/yellow]")
     else:
-        console.print(f"[dim]Stage {stage.id} still running. Resume with: wb implement {proj.slug} {stage.id}[/dim]")
+        console.print(
+            f"[dim]Stage {stage.id} still running. Resume with: wb implement {proj.slug} {stage.id}[/dim]"
+        )
 
 
 def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path) -> None:
@@ -1076,10 +1199,15 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
 
     subprocess.run(
-        ["claude", "--dangerously-skip-permissions",
-         "--system-prompt", system_prompt,
-         f"Let's implement {proj.title}."],
+        [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--system-prompt",
+            system_prompt,
+            f"Let's implement {proj.title}.",
+        ],
         cwd=sandbox_path,
+        env=_clean_env(),
     )
 
     # Codex review
@@ -1153,6 +1281,11 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         set -e
         cd "{sandbox_path}"
 
+        # Strip conda/virtualenv env vars to avoid package resolution issues
+        unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_SHLVL CONDA_EXE
+        unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
+        export PATH=$(echo "$PATH" | tr ':' '\\n' | grep -v -e miniconda -e anaconda -e '\\.venv' | tr '\\n' ':' | sed 's/:$//')
+
         echo "=== wb: Starting implementation (Claude) for {proj.slug} ==="
 
         python3 -c "
@@ -1206,8 +1339,7 @@ p.write_text(text)
         raise typer.Exit(1)
 
     subprocess.run(
-        ["tmux", "new-session", "-d", "-s", sess_name,
-         f"bash {script_path}"],
+        ["tmux", "new-session", "-d", "-s", sess_name, f"bash {script_path}"],
         check=True,
     )
 
@@ -1253,7 +1385,8 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Pushing branch {proj.branch}...[/bold]")
     subprocess.run(
         ["git", "push", "-u", "origin", proj.branch],
-        cwd=sandbox_path, check=True,
+        cwd=sandbox_path,
+        check=True,
     )
 
     console.print("[bold]Creating PR...[/bold]")
@@ -1264,18 +1397,16 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
     issue_refs = ""
     if proj.github_issues:
         issue_refs = "\n\nCloses " + ", ".join(
-            f"#{ref.split('#')[-1]}" if "#" in ref else ref
-            for ref in proj.github_issues
+            f"#{ref.split('#')[-1]}" if "#" in ref else ref for ref in proj.github_issues
         )
 
     pr_body = f"{summary}{issue_refs}"
 
     result = subprocess.run(
-        ["gh", "pr", "create",
-         "--repo", cfg.github_repo,
-         "--title", pr_title,
-         "--body", pr_body],
-        cwd=sandbox_path, capture_output=True, text=True,
+        ["gh", "pr", "create", "--repo", cfg.github_repo, "--title", pr_title, "--body", pr_body],
+        cwd=sandbox_path,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         console.print(f"[red]PR creation failed: {result.stderr}[/red]")
@@ -1339,8 +1470,7 @@ p.write_text(text)
 
     if not tmux_session_exists(sess_name):
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", sess_name,
-             f"bash {ci_script_path}"],
+            ["tmux", "new-session", "-d", "-s", sess_name, f"bash {ci_script_path}"],
             check=True,
         )
         console.print(f"[green]CI monitor launched: {sess_name}[/green]")
@@ -1381,11 +1511,16 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Chatting about: {proj.title}[/bold]")
     console.print("[dim]Informal Claude session with project context.[/dim]\n")
 
-    os.execvp("claude", [
-        "claude", "--dangerously-skip-permissions",
-        "--system-prompt", system_prompt,
-        initial_msg,
-    ])
+    os.execvp(
+        "claude",
+        [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--system-prompt",
+            system_prompt,
+            initial_msg,
+        ],
+    )
 
 
 @app.command()
@@ -1403,7 +1538,9 @@ def cursor(project: str = typer.Argument(autocompletion=complete_project)):
     # Get changed files relative to main
     result = subprocess.run(
         ["git", "diff", "--name-only", "main"],
-        cwd=sandbox_path, capture_output=True, text=True,
+        cwd=sandbox_path,
+        capture_output=True,
+        text=True,
     )
     changed_files = []
     if result.returncode == 0 and result.stdout.strip():
@@ -1471,7 +1608,9 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     subprocess.run(["git", "fetch", "origin", "main"], cwd=sandbox_path, capture_output=True)
     result = subprocess.run(
         ["git", "rebase", "origin/main"],
-        cwd=sandbox_path, capture_output=True, text=True,
+        cwd=sandbox_path,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         console.print("[yellow]Rebase onto main failed — resolve conflicts manually[/yellow]")
@@ -1513,7 +1652,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     else:
         next_port = next_free_port(6007)
         default_choice = "1" if f"wb-{proj.slug}-dev" in active_servers else "3"
-        console.print(f"\n[bold]Phoenix launch options:[/bold]")
+        console.print("\n[bold]Phoenix launch options:[/bold]")
         console.print("  [1] Skip — don't launch Phoenix")
         console.print("  [2] Replace — kill all servers, launch on :6006")
         console.print(f"  [3] New port — launch alongside existing on :{next_port}")
@@ -1525,7 +1664,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
 
         if choice == "1":
             console.print(f"[dim]Sandbox: {sandbox_path}[/dim]")
-            console.print(f"[dim]DB: ~/.phoenix[/dim]")
+            console.print("[dim]DB: ~/.phoenix[/dim]")
             return
 
         if choice == "2":
@@ -1538,7 +1677,9 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
                         update_project_note(p)
             port = 6006
             if not is_port_free(6006):
-                console.print("[yellow]Warning: port 6006 not yet free, server may take a moment to bind[/yellow]")
+                console.print(
+                    "[yellow]Warning: port 6006 not yet free, server may take a moment to bind[/yellow]"
+                )
         else:
             port = next_port
 
@@ -1552,7 +1693,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     for var in PHOENIX_CLOUD_VARS:
         lines.append(f"unset {var}")
     lines.append(f'export PHOENIX_WORKING_DIR="{Path.home() / ".phoenix"}"')
-    lines.append(f'export PHOENIX_PORT={port}')
+    lines.append(f"export PHOENIX_PORT={port}")
     lines.append(f'exec make -C "{sandbox_path}" dev')
     dev_script.write_text("\n".join(lines) + "\n")
     dev_script.chmod(0o755)
@@ -1570,7 +1711,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"  [dim]UI:[/dim]      http://localhost:{port}")
     console.print(f"  [dim]Session:[/dim] {session_name}")
     console.print(f"  [dim]Attach:[/dim]  tmux attach -t {session_name}")
-    console.print(f"  [dim]DB:[/dim]      ~/.phoenix")
+    console.print("  [dim]DB:[/dim]      ~/.phoenix")
 
 
 @app.command()
@@ -1626,7 +1767,8 @@ def done(
         if not skip:
             done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
             newly_unblocked = [
-                s for s in proj.stages
+                s
+                for s in proj.stages
                 if s.status == "pending" and all(d in done_ids for d in s.depends_on)
             ]
             if newly_unblocked:
@@ -1636,7 +1778,9 @@ def done(
         if all(s.status in ("done", "skipped") for s in proj.stages):
             proj.status = "awaiting-approval"
             update_project_note(proj)
-            console.print(f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]")
+            console.print(
+                f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]"
+            )
     else:
         # No stages — mark the whole project
         new_status = "awaiting-approval" if not skip else "archived"
@@ -1677,7 +1821,9 @@ def archive(project: str = typer.Argument(autocompletion=complete_project)):
 
 @app.command()
 def organize(
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview changes without modifying files"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n", help="Preview changes without modifying files"
+    ),
     force: bool = typer.Option(False, "--force", help="Run even if already ran today"),
 ):
     """Run the vault organizer to tag and link notes."""

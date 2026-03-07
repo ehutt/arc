@@ -35,7 +35,7 @@ Status progresses automatically: `needs-plan` → `ready` → `implementing` →
 | `wb sync` | Pull assigned GitHub issues; create or attach project notes |
 | `wb plan <slug>` | Launch interactive Claude session to plan and write a plan note |
 | `wb stage <slug>` | List, add, or plan stages for a project |
-| `wb sandbox <slug>` | Create an isolated git clone with a feature branch |
+| `wb sandbox <slug>` | Create an isolated git clone with a feature branch and Python env |
 | `wb implement <slug>` | Claude implementation → automatic Codex code review |
 | `wb implement <slug> --bg` | Autonomous Claude implementation → Codex review pipeline in tmux |
 | `wb done <slug> [stage]` | Mark a stage done (or skipped with `--skip`) without launching Claude |
@@ -72,13 +72,13 @@ Project notes are Obsidian Markdown files with YAML frontmatter. `update_project
 
 ### Sandboxes
 
-`wb sandbox` clones Phoenix using a local bare reference repo (`{sandbox_root}/.phoenix-bare`) for fast clones via `--reference --shared`. Each sandbox gets its own feature branch. Sandboxes are fully independent git repos.
+`wb sandbox` clones Phoenix using a local bare reference repo (`{sandbox_root}/.phoenix-bare`) for fast clones via `--reference --shared`. Each sandbox gets its own feature branch and runs `uv sync --python 3.10` to set up the Python environment automatically. Sandboxes are fully independent git repos.
 
 ### Agent integration
 
 `wb implement` uses a two-agent pipeline: **Claude** handles implementation and **Codex** (OpenAI, `gpt-5.3-codex`) handles code review.
 
-**Implementation (Claude):** Invoked via `subprocess.run` with a system prompt containing project context, plan content, and sandbox paths. Uses `--dangerously-skip-permissions` for full filesystem access.
+**Implementation (Claude):** Invoked via `subprocess.run` with a system prompt containing project context, plan content, and sandbox paths. Uses `--dangerously-skip-permissions` for full filesystem access. All agent subprocesses run with a cleaned environment (`_clean_env()`) that strips conda/virtualenv variables and paths, preventing package resolution from the host's Python environment.
 
 **Code review (Codex):** Runs automatically after Claude finishes. Codex receives the full project documentation, all stage plans, and the current stage context. It reviews the diff against `main`, runs tests and lint, fixes any issues, and writes `.wb-review.md`. Uses `codex exec --dangerously-bypass-approvals-and-sandbox`. The model is configured via `CODEX_MODEL` (currently `gpt-5.3-codex`).
 
@@ -129,8 +129,8 @@ user = "your-github-username"
 repo = "org/repo"
 
 [agent]
-test_cmd = "uv run pytest -x"
-lint_cmd = "ruff check && ruff format --check"
+test_cmd = "tox run -e unit_tests"
+lint_cmd = "make lint-python"
 
 [organize]
 skip_folders = ["Templates", ".obsidian", "Assets"]

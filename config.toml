@@ -9,8 +9,8 @@ user = "ehutt"
 repo = "Arize-ai/phoenix"
 
 [agent]
-test_cmd = "uv run pytest -x"
-lint_cmd = "ruff check && ruff format --check"
+test_cmd = "tox run -e unit_tests"
+lint_cmd = "make lint-python"
 
 [organize]
 skip_folders = ["Templates", ".obsidian", "Assets"]
