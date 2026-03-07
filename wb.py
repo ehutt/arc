@@ -453,6 +453,7 @@ def dashboard(ctx: typer.Context):
     table.add_column("Progress")
     table.add_column("Branch")
     table.add_column("Tmux")
+    table.add_column("Dev")
     table.add_column("Updated", justify="right")
 
     status_order = {s: i for i, s in enumerate(STATUSES)}
@@ -475,6 +476,10 @@ def dashboard(ctx: typer.Context):
             if review_sess in active_sessions:
                 tmux_info = f"[green]{review_sess}[/green]"
 
+        dev_info = ""
+        if p.dev_port and p.dev_session and p.dev_session in active_sessions:
+            dev_info = f"[cyan]:{p.dev_port}[/cyan]"
+
         url = p.obsidian_url(cfg)
         status = p.derived_status
         color = STATUS_COLORS.get(status, "white")
@@ -484,6 +489,7 @@ def dashboard(ctx: typer.Context):
             p.stage_progress(),
             branch or "[dim]—[/dim]",
             tmux_info or "[dim]—[/dim]",
+            dev_info or "[dim]—[/dim]",
             relative_time(p.updated),
         )
 
@@ -1488,6 +1494,108 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"  [dim]Session:[/dim] {session_name}")
     console.print(f"  [dim]Attach:[/dim]  tmux attach -t {session_name}")
     console.print(f"  [dim]DB:[/dim]      ~/.phoenix")
+
+
+@app.command()
+def new(title: str = typer.Argument(..., help="Project title")):
+    """Create a new project note without a GitHub issue."""
+    cfg = load_config()
+    slug = slugify(title)
+    console.print(f"Suggested slug: [bold]{slug}[/bold]")
+    custom = typer.prompt("Enter to accept, or type a custom slug", default=slug)
+    if custom and custom != slug:
+        slug = custom
+
+    existing = [p.slug for p in load_projects(cfg)]
+    if slug in existing:
+        console.print(f"[red]Project '{slug}' already exists[/red]")
+        raise typer.Exit(1)
+
+    proj = create_project_note(cfg, title, slug)
+    console.print(f"[green]Created:[/green] {proj.path}")
+    console.print(f"  Next: [bold]wb plan {slug}[/bold]")
+
+
+@app.command()
+def done(
+    project: str = typer.Argument(autocompletion=complete_project),
+    stage_id: int = typer.Argument(None),
+    skip: bool = typer.Option(False, "--skip", help="Mark as skipped instead of done"),
+):
+    """Mark a stage (or whole project) as done without launching Claude."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    if proj.stages:
+        if stage_id is None:
+            # Default to the first running or next available stage
+            stage = next((s for s in proj.stages if s.status == "running"), None)
+            if stage is None:
+                stage = proj.next_available_stage()
+            if stage is None:
+                console.print("[yellow]No pending/running stages.[/yellow]")
+                raise typer.Exit(0)
+        else:
+            stage = proj.get_stage(stage_id)
+            if stage is None:
+                console.print(f"[red]Stage {stage_id} not found[/red]")
+                raise typer.Exit(1)
+
+        new_status = "skipped" if skip else "done"
+        stage.status = new_status
+        update_project_note(proj)
+        console.print(f"[green]Stage {stage.id} ({stage.name}) marked {new_status}.[/green]")
+
+        if not skip:
+            done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
+            newly_unblocked = [
+                s for s in proj.stages
+                if s.status == "pending" and all(d in done_ids for d in s.depends_on)
+            ]
+            if newly_unblocked:
+                names = [f"{s.id} ({s.name})" for s in newly_unblocked]
+                console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
+
+        if all(s.status in ("done", "skipped") for s in proj.stages):
+            proj.status = "awaiting-approval"
+            update_project_note(proj)
+            console.print(f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]")
+    else:
+        # No stages — mark the whole project
+        new_status = "awaiting-approval" if not skip else "archived"
+        proj.status = new_status
+        update_project_note(proj)
+        console.print(f"[green]{proj.slug} marked {new_status}.[/green]")
+
+
+@app.command()
+def archive(project: str = typer.Argument(autocompletion=complete_project)):
+    """Archive a project and clean up its background sessions."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    # Kill dev server session if running
+    if proj.dev_session and tmux_session_exists(proj.dev_session):
+        subprocess.run(["tmux", "kill-session", "-t", proj.dev_session], capture_output=True)
+        console.print(f"[dim]Killed dev session: {proj.dev_session}[/dim]")
+
+    # Kill CI monitor if running
+    ci_sess = f"wb-{proj.slug}-ci"
+    if tmux_session_exists(ci_sess):
+        subprocess.run(["tmux", "kill-session", "-t", ci_sess], capture_output=True)
+        console.print(f"[dim]Killed CI session: {ci_sess}[/dim]")
+
+    # Kill implement session if running
+    impl_sess = f"wb-{proj.slug}"
+    if tmux_session_exists(impl_sess):
+        subprocess.run(["tmux", "kill-session", "-t", impl_sess], capture_output=True)
+        console.print(f"[dim]Killed implement session: {impl_sess}[/dim]")
+
+    proj.status = "archived"
+    proj.dev_port = 0
+    proj.dev_session = ""
+    update_project_note(proj)
+    console.print(f"[green]{proj.slug} archived.[/green]")
 
 
 if __name__ == "__main__":
