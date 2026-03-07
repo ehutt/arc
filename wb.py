@@ -1675,5 +1675,24 @@ def archive(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[green]{proj.slug} archived.[/green]")
 
 
+@app.command()
+def organize(
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview changes without modifying files"),
+    force: bool = typer.Option(False, "--force", help="Run even if already ran today"),
+):
+    """Run the vault organizer to tag and link notes."""
+    script = Path(__file__).resolve().parent / "organize.py"
+    if not script.exists():
+        console.print("[red]organize.py not found[/red]")
+        raise typer.Exit(1)
+    cmd = [sys.executable, str(script)]
+    if dry_run:
+        cmd.append("--dry-run")
+    if force:
+        cmd.append("--force")
+    result = subprocess.run(cmd)
+    raise typer.Exit(result.returncode)
+
+
 if __name__ == "__main__":
     app()

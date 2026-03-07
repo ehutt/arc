@@ -45,10 +45,11 @@ Status progresses automatically: `needs-plan` → `ready` → `implementing` →
 | `wb open <slug>` | Open project note in Obsidian |
 | `wb chat <slug>` | Informal Claude chat session with project context |
 | `wb cursor <slug>` | Open sandbox in Cursor with changed files pre-loaded |
+| `wb organize` | Run the daily vault organizer (tag & link notes) |
 
 ## Architecture
 
-**Single file:** `wb.py` (~1600 lines) + `config.toml`. No database — all state is YAML frontmatter in Obsidian notes.
+**Core:** `wb.py` (~1700 lines) + `organize.py` + `config.toml`. No database — all state is YAML frontmatter in Obsidian notes.
 
 ### Data model
 
@@ -101,6 +102,19 @@ Long-running processes run in named tmux sessions:
 
 `wb approve` writes a bash script that polls `gh pr view` every 60 seconds. On merge it archives the project note, clears dev server state, and sends a macOS notification. On CI failure it invokes Claude autonomously to fix the issues.
 
+### Vault organizer
+
+`organize.py` is a separate inline uv script that runs daily (via launchd) to keep the vault tidy:
+
+1. Scans vault for new/changed `.md` files (tracked by body SHA-256 in `.organize-state.json`)
+2. Sends each changed note to Claude with vault context (existing tags, active projects)
+3. Adds tags to frontmatter (additive only), inserts `[[wikilinks]]`, appends to project `related_notes`
+4. All writes are atomic (write `.tmp` then `os.replace()`); iCloud placeholders are skipped
+
+The launchd agent (`com.elizabethhutton.vault-organize`) runs hourly and at login. The script debounces to once per day. Use `wb organize --dry-run` to preview changes, or `wb organize --force` to re-run.
+
+API key is stored in macOS Keychain (`security find-generic-password -a vault-organize -s ANTHROPIC_API_KEY`).
+
 ## Configuration
 
 ```toml
@@ -117,12 +131,17 @@ repo = "org/repo"
 [agent]
 test_cmd = "uv run pytest -x"
 lint_cmd = "ruff check && ruff format --check"
+
+[organize]
+skip_folders = ["Templates", ".obsidian", "Assets"]
+max_notes_per_run = 20
+model = "claude-sonnet-4-20250514"
 ```
 
 ## Dependencies
 
 - Python 3.11+, [`uv`](https://github.com/astral-sh/uv) (script runner)
-- `typer`, `rich`, `pyyaml` (auto-installed by uv)
+- `typer`, `rich`, `pyyaml`, `anthropic` (auto-installed by uv)
 - `gh` CLI, `tmux`, `git`
 - `claude` CLI (Claude Code)
 - `codex` CLI ([OpenAI Codex](https://github.com/openai/codex)) — `npm install -g @openai/codex`

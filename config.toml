@@ -11,3 +11,8 @@ repo = "Arize-ai/phoenix"
 [agent]
 test_cmd = "uv run pytest -x"
 lint_cmd = "ruff check && ruff format --check"
+
+[organize]
+skip_folders = ["Templates", ".obsidian", "Assets"]
+max_notes_per_run = 20
+model = "claude-sonnet-4-20250514"
