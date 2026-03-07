@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import subprocess
 import sys
 import textwrap
@@ -131,6 +132,8 @@ class Project:
     related_notes: list[str] = field(default_factory=list)
     plans: list[str] = field(default_factory=list)
     stages: list[Stage] = field(default_factory=list)
+    dev_port: int = 0
+    dev_session: str = ""
     path: Path | None = None
 
     @property
@@ -179,6 +182,10 @@ class Project:
         }
         if self.stages:
             d["stages"] = [s.to_dict() for s in self.stages]
+        if self.dev_port:
+            d["dev_port"] = self.dev_port
+        if self.dev_session:
+            d["dev_session"] = self.dev_session
         return d
 
     def stage_progress(self) -> str:
@@ -261,6 +268,8 @@ def parse_project(path: Path) -> Project | None:
         related_notes=fm.get("related_notes", []),
         plans=fm.get("plans", []),
         stages=stages,
+        dev_port=int(fm.get("dev_port", 0)),
+        dev_session=fm.get("dev_session", ""),
         path=path,
     )
 
@@ -378,6 +387,19 @@ def tmux_sessions() -> list[str]:
     if result.returncode != 0:
         return []
     return result.stdout.strip().splitlines()
+
+
+def is_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.1)
+        return s.connect_ex(("localhost", port)) != 0
+
+
+def next_free_port(start: int = 6006) -> int:
+    port = start
+    while not is_port_free(port):
+        port += 1
+    return port
 
 
 def notify(title: str, message: str) -> None:
@@ -1199,12 +1221,15 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
 
             if [ "$state" = "MERGED" ]; then
                 echo "=== wb: PR merged! ==="
+                tmux kill-session -t "wb-{proj.slug}-dev" 2>/dev/null || true
                 python3 -c "
 import re
 from pathlib import Path
 p = Path('{project_note_path}')
 text = p.read_text()
 text = re.sub(r'status: \\w[\\w-]*', 'status: archived', text, count=1)
+text = re.sub(r'\\ndev_port:.*', '', text)
+text = re.sub(r'\\ndev_session:.*', '', text)
 p.write_text(text)
 "
                 osascript -e 'display notification "PR merged!" with title "wb: {proj.slug}"'
@@ -1238,6 +1263,231 @@ p.write_text(text)
         console.print(f"[green]CI monitor launched: {sess_name}[/green]")
 
     console.print(f"\n[bold]Done![/bold] PR: {pr_url}")
+
+
+@app.command("open")
+def open_cmd(project: str = typer.Argument(autocompletion=complete_project)):
+    """Open a project's Obsidian note."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+    url = proj.obsidian_url(cfg)
+    subprocess.run(["open", url])
+    console.print(f"[green]Opened {proj.slug} in Obsidian[/green]")
+
+
+@app.command()
+def chat(project: str = typer.Argument(autocompletion=complete_project)):
+    """Launch an informal Claude chat with project context."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    note_path = proj.path
+    sandbox_info = f"Sandbox path: {proj.sandbox}" if proj.sandbox else "No sandbox configured."
+
+    system_prompt = textwrap.dedent(f"""\
+        Project: {proj.title}
+        Project note: {note_path}
+        {sandbox_info}
+        Obsidian vault: {cfg.obsidian_vault}
+
+        You have context about this project. The user wants to chat informally — answer questions, brainstorm, help think through problems. If they reference code, you can read files in the sandbox path.
+    """)
+
+    initial_msg = f"Read the project note at {note_path}"
+
+    console.print(f"[bold]Chatting about: {proj.title}[/bold]")
+    console.print("[dim]Informal Claude session with project context.[/dim]\n")
+
+    os.execvp("claude", [
+        "claude", "--dangerously-skip-permissions",
+        "--system-prompt", system_prompt,
+        initial_msg,
+    ])
+
+
+@app.command()
+def cursor(project: str = typer.Argument(autocompletion=complete_project)):
+    """Open project sandbox in Cursor with changed files."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    if not proj.sandbox or not Path(proj.sandbox).exists():
+        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
+        raise typer.Exit(1)
+
+    sandbox_path = Path(proj.sandbox)
+
+    # Get changed files relative to main
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "main"],
+        cwd=sandbox_path, capture_output=True, text=True,
+    )
+    changed_files = []
+    if result.returncode == 0 and result.stdout.strip():
+        changed_files = result.stdout.strip().splitlines()
+
+    cmd = ["cursor", str(sandbox_path)] + changed_files
+    console.print(f"[green]Opening {proj.slug} in Cursor[/green]")
+    if changed_files:
+        console.print(f"[dim]{len(changed_files)} changed file(s)[/dim]")
+    subprocess.run(cmd)
+
+
+# Env var names to carry over from the main phoenix .env
+MODEL_API_KEYS = [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "KAGGLE_USERNAME",
+    "KAGGLE_KEY",
+]
+
+# Phoenix cloud vars to unset for local dev
+PHOENIX_CLOUD_VARS = [
+    "PHOENIX_HOST",
+    "PHOENIX_COLLECTOR_ENDPOINT",
+    "PHOENIX_API_KEY",
+]
+
+
+@app.command()
+def dev(project: str = typer.Argument(autocompletion=complete_project)):
+    """Launch local Phoenix dev environment for a project sandbox."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    if not proj.sandbox or not Path(proj.sandbox).exists():
+        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
+        raise typer.Exit(1)
+
+    sandbox_path = Path(proj.sandbox)
+
+    # Source model API keys from main phoenix .env
+    env_file = cfg.sandbox_root.parent / "phoenix" / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Strip optional "export " prefix
+            if line.startswith("export "):
+                line = line[7:]
+            key, _, value = line.partition("=")
+            if key in MODEL_API_KEYS:
+                os.environ[key] = value
+
+    # Unset cloud-targeting vars
+    for var in PHOENIX_CLOUD_VARS:
+        os.environ.pop(var, None)
+
+    # Point to shared local DB
+    os.environ["PHOENIX_WORKING_DIR"] = str(Path.home() / ".phoenix")
+
+    # Pull latest from main and rebase
+    console.print("[dim]Pulling latest from main...[/dim]")
+    subprocess.run(["git", "fetch", "origin", "main"], cwd=sandbox_path, capture_output=True)
+    result = subprocess.run(
+        ["git", "rebase", "origin/main"],
+        cwd=sandbox_path, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        console.print("[yellow]Rebase onto main failed — resolve conflicts manually[/yellow]")
+        console.print(f"[dim]{result.stderr.strip()}[/dim]")
+        raise typer.Exit(1)
+
+    # Run setup if needed (check for .venv as proxy)
+    if not (sandbox_path / ".venv").exists():
+        console.print("[bold]Running initial setup (make setup)...[/bold]")
+        result = subprocess.run(["make", "setup"], cwd=sandbox_path)
+        if result.returncode != 0:
+            console.print("[red]Setup failed[/red]")
+            raise typer.Exit(1)
+
+    # Step 1: Stale session cleanup
+    if proj.dev_session and not tmux_session_exists(proj.dev_session):
+        proj.dev_port = 0
+        proj.dev_session = ""
+        update_project_note(proj)
+
+    # Step 2: Discover active servers
+    all_projs = load_projects(cfg)
+    active_servers = {
+        p.dev_session: p.dev_port
+        for p in all_projs
+        if p.dev_port and p.dev_session and tmux_session_exists(p.dev_session)
+    }
+
+    # Step 3: Show status if servers are running
+    if active_servers:
+        console.print("[dim]Running Phoenix servers:[/dim]")
+        for sess, port in active_servers.items():
+            marker = " ← this project" if sess == f"wb-{proj.slug}-dev" else ""
+            console.print(f"  [cyan]{sess}[/cyan]  http://localhost:{port}{marker}")
+
+    # Step 4: Determine launch action
+    if not active_servers:
+        port = 6006
+    else:
+        next_port = next_free_port(6007)
+        default_choice = "1" if f"wb-{proj.slug}-dev" in active_servers else "3"
+        console.print(f"\n[bold]Phoenix launch options:[/bold]")
+        console.print("  [1] Skip — don't launch Phoenix")
+        console.print("  [2] Replace — kill all servers, launch on :6006")
+        console.print(f"  [3] New port — launch alongside existing on :{next_port}")
+        while True:
+            choice = typer.prompt("Choice", default=default_choice)
+            if choice in ("1", "2", "3"):
+                break
+            console.print("[yellow]Enter 1, 2, or 3[/yellow]")
+
+        if choice == "1":
+            console.print(f"[dim]Sandbox: {sandbox_path}[/dim]")
+            console.print(f"[dim]DB: ~/.phoenix[/dim]")
+            return
+
+        if choice == "2":
+            for sess, p_port in list(active_servers.items()):
+                subprocess.run(["tmux", "kill-session", "-t", sess], capture_output=True)
+                for p in all_projs:
+                    if p.dev_session == sess:
+                        p.dev_port = 0
+                        p.dev_session = ""
+                        update_project_note(p)
+            port = 6006
+            if not is_port_free(6006):
+                console.print("[yellow]Warning: port 6006 not yet free, server may take a moment to bind[/yellow]")
+        else:
+            port = next_port
+
+    # Step 5: Launch in tmux background
+    dev_script = Path(f"/tmp/wb-dev-{proj.slug}.sh")
+    lines = ["#!/usr/bin/env bash"]
+    for key in MODEL_API_KEYS:
+        val = os.environ.get(key, "")
+        if val:
+            lines.append(f'export {key}="{val}"')
+    for var in PHOENIX_CLOUD_VARS:
+        lines.append(f"unset {var}")
+    lines.append(f'export PHOENIX_WORKING_DIR="{Path.home() / ".phoenix"}"')
+    lines.append(f'export PHOENIX_PORT={port}')
+    lines.append(f'exec make -C "{sandbox_path}" dev')
+    dev_script.write_text("\n".join(lines) + "\n")
+    dev_script.chmod(0o755)
+
+    session_name = f"wb-{proj.slug}-dev"
+    if tmux_session_exists(session_name):
+        subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+    subprocess.run(["tmux", "new-session", "-d", "-s", session_name, str(dev_script)], check=True)
+
+    proj.dev_port = port
+    proj.dev_session = session_name
+    update_project_note(proj)
+
+    console.print(f"\n[bold green]Phoenix started for {proj.slug}[/bold green]")
+    console.print(f"  [dim]UI:[/dim]      http://localhost:{port}")
+    console.print(f"  [dim]Session:[/dim] {session_name}")
+    console.print(f"  [dim]Attach:[/dim]  tmux attach -t {session_name}")
+    console.print(f"  [dim]DB:[/dim]      ~/.phoenix")
 
 
 if __name__ == "__main__":
