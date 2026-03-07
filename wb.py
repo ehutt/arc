@@ -884,6 +884,66 @@ def implement(
         _implement_interactive_simple(cfg, proj, sandbox_path)
 
 
+CODEX_MODEL = "gpt-5.3-codex"
+
+
+def _codex_review(cfg: Config, proj: Project, sandbox_path: Path,
+                  stage_context: str = "") -> None:
+    """Run code review with Codex (gpt-5.3-codex) after Claude implementation."""
+    console.print()
+    console.print("[bold cyan]Starting Codex code review...[/bold cyan]")
+    console.print(f"[dim]Model: {CODEX_MODEL}[/dim]")
+
+    proj.status = "reviewing"
+    update_project_note(proj)
+
+    # Gather project documentation
+    note_content = proj.path.read_text() if proj.path and proj.path.exists() else ""
+
+    # Gather all stage plans if staged project
+    plans_context = ""
+    if proj.stages and proj.folder:
+        for s in proj.stages:
+            if s.plan:
+                plan_path = proj.folder / s.plan
+                if plan_path.exists():
+                    plans_context += f"\n### Stage {s.id}: {s.name}\n{plan_path.read_text()}\n"
+
+    review_prompt = textwrap.dedent(f"""\
+        You are reviewing an implementation for project: {proj.title}
+
+        ## Project Documentation
+        {note_content}
+
+        {f"## Stage Context{chr(10)}{stage_context}" if stage_context else ""}
+
+        {f"## Implementation Plans{plans_context}" if plans_context else ""}
+
+        ## Review Instructions
+        1. Run `git diff main` to see all changes
+        2. Review for correctness against the project requirements and plans above
+        3. Check for edge cases, code quality, and adherence to the plan
+        4. Run tests: `{cfg.test_cmd}`
+        5. Run lint: `{cfg.lint_cmd}`
+        6. Fix any issues you find and commit fixes with clear messages
+        7. When done, write `.wb-review.md` summarizing your findings and any fixes made
+    """)
+
+    subprocess.run(
+        ["codex", "exec",
+         "--dangerously-bypass-approvals-and-sandbox",
+         "-m", CODEX_MODEL,
+         "-C", str(sandbox_path),
+         review_prompt],
+    )
+
+    console.print("[green]Codex review complete.[/green]")
+
+    proj.status = "awaiting-approval"
+    update_project_note(proj)
+    notify("wb", f"Implementation + Codex review complete for {proj.slug}")
+
+
 def _implement_interactive_staged(cfg: Config, proj: Project, sandbox_path: Path,
                                   stage_id: int | None) -> None:
     """Interactive implementation of a single stage."""
@@ -953,6 +1013,12 @@ def _implement_interactive_staged(cfg: Config, proj: Project, sandbox_path: Path
         cwd=sandbox_path,
     )
 
+    # Codex review with stage context
+    stage_ctx = f"Reviewing stage {stage.id}: {stage.name}"
+    if plan_content:
+        stage_ctx += f"\n\n{plan_content}"
+    _codex_review(cfg, proj, sandbox_path, stage_context=stage_ctx)
+
     # Post-exit prompt
     console.print()
     choice = input(f"Mark '{stage.name}' as done? [Y/n/skip] ").strip().lower()
@@ -1016,13 +1082,16 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
         cwd=sandbox_path,
     )
 
+    # Codex review
+    _codex_review(cfg, proj, sandbox_path)
+
     console.print()
-    choice = input("Mark project as awaiting-approval? [Y/n] ").strip().lower()
+    choice = input("Ready to approve? [Y/n] ").strip().lower()
     if choice in ("", "y", "yes"):
-        proj.status = "awaiting-approval"
-        update_project_note(proj)
         console.print(f"[green]Ready for approval. Run: wb approve {proj.slug}[/green]")
     else:
+        proj.status = "implementing"
+        update_project_note(proj)
         console.print(f"[dim]Project still implementing. Re-run: wb implement {proj.slug}[/dim]")
 
 
@@ -1049,22 +1118,34 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
     """)
     (sandbox_path / "CLAUDE.md").write_text(claude_md)
 
-    review_claude_md = textwrap.dedent(f"""\
-        # Review: {proj.title}
+    # Build Codex review prompt with full project context
+    plans_context = ""
+    if proj.stages and proj.folder:
+        for s in proj.stages:
+            if s.plan:
+                plan_path = proj.folder / s.plan
+                if plan_path.exists():
+                    plans_context += f"\n### Stage {s.id}: {s.name}\n{plan_path.read_text()}\n"
 
-        You are reviewing the implementation of this project.
+    codex_review_prompt = textwrap.dedent(f"""\
+        You are reviewing an implementation for project: {proj.title}
 
-        ## Instructions
+        ## Project Documentation
+        {note_content}
+
+        {f"## Implementation Plans{plans_context}" if plans_context else ""}
+
+        ## Review Instructions
         1. Run `git diff main` to see all changes
-        2. Review for correctness, edge cases, code quality
-        3. Run tests: `{cfg.test_cmd}`
-        4. Run lint: `{cfg.lint_cmd}`
-        5. Fix any issues you find
-        6. Commit fixes with clear messages
-        7. Write `.wb-review.md` with your review findings
+        2. Review for correctness against the project requirements and plans above
+        3. Check for edge cases, code quality, and adherence to the plan
+        4. Run tests: `{cfg.test_cmd}`
+        5. Run lint: `{cfg.lint_cmd}`
+        6. Fix any issues you find and commit fixes with clear messages
+        7. Write `.wb-review.md` summarizing your findings and any fixes made
     """)
+    codex_review_prompt_escaped = codex_review_prompt.replace("'", "'\\''")
 
-    review_claude_md_escaped = review_claude_md.replace("'", "'\\''")
     project_note_path = str(proj.path) if proj.path else ""
 
     orchestrator = textwrap.dedent(f"""\
@@ -1072,7 +1153,7 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         set -e
         cd "{sandbox_path}"
 
-        echo "=== wb: Starting implementation for {proj.slug} ==="
+        echo "=== wb: Starting implementation (Claude) for {proj.slug} ==="
 
         python3 -c "
 import re, yaml
@@ -1085,11 +1166,7 @@ p.write_text(text)
 
         claude --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Commit your work. Write .wb-summary.md when done."
 
-        echo "=== wb: Implementation done, starting review ==="
-
-        cat > CLAUDE.md << 'REVIEWEOF'
-        {review_claude_md_escaped}
-        REVIEWEOF
+        echo "=== wb: Implementation done, starting Codex review ({CODEX_MODEL}) ==="
 
         python3 -c "
 import re
@@ -1100,9 +1177,9 @@ text = re.sub(r'status: \\w[\\w-]*', 'status: reviewing', text, count=1)
 p.write_text(text)
 "
 
-        claude --dangerously-skip-permissions -p "Read CLAUDE.md. Review the diff against main. Fix issues. Write .wb-review.md when done."
+        codex exec --dangerously-bypass-approvals-and-sandbox -m {CODEX_MODEL} '{codex_review_prompt_escaped}'
 
-        echo "=== wb: Review complete ==="
+        echo "=== wb: Codex review complete ==="
 
         python3 -c "
 import re
@@ -1113,7 +1190,7 @@ text = re.sub(r'status: \\w[\\w-]*', 'status: awaiting-approval', text, count=1)
 p.write_text(text)
 "
 
-        osascript -e 'display notification "Implementation + review complete. Run: wb approve {proj.slug}" with title "wb: {proj.slug}"'
+        osascript -e 'display notification "Claude implementation + Codex review complete. Run: wb approve {proj.slug}" with title "wb: {proj.slug}"'
         echo -e "\\a"
         echo "=== wb: {proj.slug} is awaiting approval. Run: wb approve {proj.slug} ==="
     """)

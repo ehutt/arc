@@ -16,8 +16,8 @@ wb new <title>   # create a project note from scratch (no GitHub issue needed)
 wb sync          # pull assigned GitHub issues, create/attach project notes
 wb plan <slug>   # interactive Claude session to write a plan
 wb sandbox <slug>  # clone Phoenix into an isolated sandbox
-wb implement <slug>         # interactive Claude coding session
-wb implement <slug> --bg    # autonomous implement → review pipeline in tmux
+wb implement <slug>         # Claude implementation → Codex code review
+wb implement <slug> --bg    # autonomous Claude → Codex review pipeline in tmux
 wb done <slug> [stage]      # mark a stage done without launching Claude
 wb approve <slug>  # push branch, open PR, start CI monitor
 wb dev <slug>      # launch Phoenix dev server in background tmux
@@ -36,8 +36,8 @@ Status progresses automatically: `needs-plan` → `ready` → `implementing` →
 | `wb plan <slug>` | Launch interactive Claude session to plan and write a plan note |
 | `wb stage <slug>` | List, add, or plan stages for a project |
 | `wb sandbox <slug>` | Create an isolated git clone with a feature branch |
-| `wb implement <slug>` | Run Claude interactively on the next available stage |
-| `wb implement <slug> --bg` | Autonomous implement → self-review pipeline in tmux |
+| `wb implement <slug>` | Claude implementation → automatic Codex code review |
+| `wb implement <slug> --bg` | Autonomous Claude implementation → Codex review pipeline in tmux |
 | `wb done <slug> [stage]` | Mark a stage done (or skipped with `--skip`) without launching Claude |
 | `wb approve <slug>` | Push branch, create PR via `gh`, launch CI monitor in tmux |
 | `wb dev <slug>` | Launch Phoenix dev server in a background tmux session with port management |
@@ -75,7 +75,15 @@ Project notes are Obsidian Markdown files with YAML frontmatter. `update_project
 
 ### Agent integration
 
-Claude is invoked via `os.execvp` (interactive, replaces the process) or `subprocess.run` (when chaining). Each command builds a system prompt with relevant project context, plan content, and sandbox paths. The `--dangerously-skip-permissions` flag is used throughout since the agent needs full filesystem access in the sandbox.
+`wb implement` uses a two-agent pipeline: **Claude** handles implementation and **Codex** (OpenAI, `gpt-5.3-codex`) handles code review.
+
+**Implementation (Claude):** Invoked via `subprocess.run` with a system prompt containing project context, plan content, and sandbox paths. Uses `--dangerously-skip-permissions` for full filesystem access.
+
+**Code review (Codex):** Runs automatically after Claude finishes. Codex receives the full project documentation, all stage plans, and the current stage context. It reviews the diff against `main`, runs tests and lint, fixes any issues, and writes `.wb-review.md`. Uses `codex exec --dangerously-bypass-approvals-and-sandbox`. The model is configured via `CODEX_MODEL` (currently `gpt-5.3-codex`).
+
+In interactive mode, you are prompted to approve only after both agents complete. In `--bg` mode, a macOS notification fires when the full pipeline finishes.
+
+Other commands (`plan`, `chat`, `cursor`) still use Claude via `os.execvp` (replaces the process).
 
 ### tmux sessions
 
@@ -117,4 +125,5 @@ lint_cmd = "ruff check && ruff format --check"
 - `typer`, `rich`, `pyyaml` (auto-installed by uv)
 - `gh` CLI, `tmux`, `git`
 - `claude` CLI (Claude Code)
+- `codex` CLI ([OpenAI Codex](https://github.com/openai/codex)) — `npm install -g @openai/codex`
 - macOS (uses `osascript` for notifications)
