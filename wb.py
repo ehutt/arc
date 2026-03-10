@@ -60,7 +60,11 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
-app = typer.Typer(invoke_without_command=True, no_args_is_help=False)
+app = typer.Typer(
+    invoke_without_command=True,
+    no_args_is_help=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 console = Console()
 
 STATUSES = [
@@ -68,6 +72,7 @@ STATUSES = [
     "ready",
     "implementing",
     "reviewing",
+    "reviewed",
     "awaiting-approval",
     "pr-open",
     "archived",
@@ -78,6 +83,7 @@ STATUS_COLORS = {
     "ready": "green",
     "implementing": "yellow",
     "reviewing": "yellow",
+    "reviewed": "cyan",
     "awaiting-approval": "cyan",
     "pr-open": "magenta",
     "archived": "dim",
@@ -259,7 +265,7 @@ def derive_project_status(stages: list[Stage]) -> str:
     if not stages:
         return "needs-plan"
     if all(s.status in ("done", "skipped") for s in stages):
-        return "awaiting-approval"
+        return "reviewed"
     if "running" in {s.status for s in stages}:
         return "implementing"
     if all(s.status == "pending" for s in stages):
@@ -507,7 +513,9 @@ def dashboard(ctx: typer.Context):
     status_order = {s: i for i, s in enumerate(STATUSES)}
     projects.sort(
         key=lambda p: (
-            0 if p.derived_status in ("implementing", "reviewing", "awaiting-approval") else 1,
+            0
+            if p.derived_status in ("implementing", "reviewing", "reviewed", "awaiting-approval")
+            else 1,
             status_order.get(p.derived_status, 99),
         )
     )
@@ -1055,9 +1063,9 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context:
 
     console.print("[green]Codex review complete.[/green]")
 
-    proj.status = "awaiting-approval"
+    proj.status = "reviewed"
     update_project_note(proj)
-    notify("wb", f"Implementation + Codex review complete for {proj.slug}")
+    notify("wb", f"AI review complete for {proj.slug} — ready for your review")
 
 
 def _implement_interactive_staged(
@@ -1160,12 +1168,12 @@ def _implement_interactive_staged(
             console.print("[dim]No new stages unblocked.[/dim]")
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
-            proj.status = "awaiting-approval"
+            proj.status = "reviewed"
             update_project_note(proj)
             console.print(
-                f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]"
+                f"[green bold]All stages complete! Review changes, then: wb approve {proj.slug}[/green bold]"
             )
-            notify("wb", f"All stages complete for {proj.slug}")
+            notify("wb", f"AI review complete for {proj.slug} — ready for your review")
 
     elif choice == "skip":
         stage.status = "skipped"
@@ -1319,13 +1327,13 @@ import re
 from pathlib import Path
 p = Path('{project_note_path}')
 text = p.read_text()
-text = re.sub(r'status: \\w[\\w-]*', 'status: awaiting-approval', text, count=1)
+text = re.sub(r'status: \\w[\\w-]*', 'status: reviewed', text, count=1)
 p.write_text(text)
 "
 
-        osascript -e 'display notification "Claude implementation + Codex review complete. Run: wb approve {proj.slug}" with title "wb: {proj.slug}"'
+        osascript -e 'display notification "AI review complete for {proj.slug}. Ready for your review." with title "wb: {proj.slug}"'
         echo -e "\\a"
-        echo "=== wb: {proj.slug} is awaiting approval. Run: wb approve {proj.slug} ==="
+        echo "=== wb: {proj.slug} AI review complete. Review changes, then: wb approve {proj.slug} ==="
     """)
 
     script_path = sandbox_path / ".wb-orchestrate.sh"
@@ -1357,14 +1365,19 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
     cfg = load_config()
     proj = find_project(cfg, project)
 
-    if proj.status != "awaiting-approval":
+    if proj.status not in ("reviewed", "awaiting-approval"):
         if proj.status == "pr-open":
             console.print(f"[yellow]PR already open for {proj.slug}[/yellow]")
             if proj.github_prs:
                 console.print(f"  {proj.github_prs[-1]}")
             raise typer.Exit(0)
-        console.print(f"[red]Project status is '{proj.status}', expected 'awaiting-approval'[/red]")
+        console.print(
+            f"[red]Project status is '{proj.status}', expected 'reviewed' or 'awaiting-approval'[/red]"
+        )
         raise typer.Exit(1)
+
+    proj.status = "awaiting-approval"
+    update_project_note(proj)
 
     sandbox_path = Path(proj.sandbox)
     if not sandbox_path.exists():
@@ -1776,14 +1789,14 @@ def done(
                 console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
-            proj.status = "awaiting-approval"
+            proj.status = "reviewed"
             update_project_note(proj)
             console.print(
-                f"[green bold]All stages complete! Run: wb approve {proj.slug}[/green bold]"
+                f"[green bold]All stages complete! Review changes, then: wb approve {proj.slug}[/green bold]"
             )
     else:
         # No stages — mark the whole project
-        new_status = "awaiting-approval" if not skip else "archived"
+        new_status = "reviewed" if not skip else "archived"
         proj.status = new_status
         update_project_note(proj)
         console.print(f"[green]{proj.slug} marked {new_status}.[/green]")
@@ -1838,6 +1851,52 @@ def organize(
         cmd.append("--force")
     result = subprocess.run(cmd)
     raise typer.Exit(result.returncode)
+
+
+@app.command()
+def tui():
+    """Launch the TUI workspace control panel in tmux."""
+    session = "wb-workspace"
+
+    # If session exists, just attach
+    if tmux_session_exists(session):
+        console.print(f"[dim]Attaching to existing {session}...[/dim]")
+        os.execvp("tmux", ["tmux", "attach-session", "-t", session])
+
+    cfg = load_config()
+    tui_script = str(Path(__file__).resolve().parent / "tui.py")
+
+    # Create session with a plain shell in window 0, then send the TUI command.
+    # This ensures the shell initializes with full PATH (uv, etc.) from .zshrc.
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, "-n", "tui"],
+        check=True,
+    )
+    # Add "home" hint to the tmux status bar so it's visible from any window
+    subprocess.run(
+        ["tmux", "set-option", "-t", session, "status-right", " Ctrl-b 0 = home "],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["tmux", "send-keys", "-t", f"{session}:tui", f"uv run --script {tui_script}", "Enter"],
+        capture_output=True,
+    )
+
+    # Create a window per active project (skip archived/needs-plan)
+    for proj in load_projects(cfg):
+        if proj.derived_status in ("archived", "needs-plan"):
+            continue
+        sandbox = proj.sandbox or str(cfg.sandbox_root / proj.slug)
+        sandbox_path = Path(sandbox).expanduser()
+        start_dir = str(sandbox_path) if sandbox_path.exists() else str(Path.home())
+        subprocess.run(
+            ["tmux", "new-window", "-t", session, "-n", proj.slug, "-c", start_dir],
+            capture_output=True,
+        )
+
+    # Select window 0 (tui) and attach
+    subprocess.run(["tmux", "select-window", "-t", f"{session}:tui"], capture_output=True)
+    os.execvp("tmux", ["tmux", "attach-session", "-t", session])
 
 
 if __name__ == "__main__":
