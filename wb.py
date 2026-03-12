@@ -196,7 +196,7 @@ class Project:
     def derived_status(self) -> str:
         if not self.stages:
             return self.status
-        return derive_project_status(self.stages)
+        return derive_project_status(self.stages, self.status)
 
     def obsidian_url(self, cfg: Config) -> str:
         vault_name = cfg.obsidian_vault.name
@@ -263,16 +263,26 @@ class Project:
         return [s for s in self.stages if s.id in blocking_ids]
 
 
-def derive_project_status(stages: list[Stage]) -> str:
+def derive_project_status(stages: list[Stage], manual_status: str = "") -> str:
     if not stages:
-        return "needs-plan"
+        return manual_status or "needs-plan"
+    # Compute stage-based status
     if all(s.status in ("done", "skipped") for s in stages):
-        return "reviewed"
-    if "running" in {s.status for s in stages}:
-        return "implementing"
-    if all(s.status == "pending" for s in stages):
-        return "ready"
-    return "implementing"
+        stage_status = "reviewed"
+    elif "running" in {s.status for s in stages}:
+        stage_status = "implementing"
+    elif all(s.status == "pending" for s in stages):
+        stage_status = "ready"
+    else:
+        stage_status = "implementing"
+
+    # Allow manual lifecycle overrides for post-completion states
+    if manual_status in ("reviewing", "awaiting-approval", "pr-open", "archived"):
+        if manual_status == "reviewing" and stage_status in ("implementing", "reviewed"):
+            return "reviewing"
+        if manual_status in ("awaiting-approval", "pr-open", "archived") and stage_status == "reviewed":
+            return manual_status
+    return stage_status
 
 
 def parse_project(path: Path) -> Project | None:
@@ -365,8 +375,8 @@ def update_project_note(project: Project) -> None:
     m = re.match(r"^---\n.+?\n---\n?", text, re.DOTALL)
     body = text[m.end() :] if m else text
     project.updated = datetime.now().strftime("%Y-%m-%d")
-    if project.stages:
-        project.status = derive_project_status(project.stages)
+    if project.stages and project.status not in ("awaiting-approval", "pr-open", "archived"):
+        project.status = derive_project_status(project.stages, project.status)
     fm = yaml.dump(project.frontmatter_dict(), default_flow_style=False, sort_keys=False)
     project.path.write_text(f"---\n{fm}---\n{body}")
 
@@ -415,6 +425,43 @@ def slugify(text: str) -> str:
     return re.sub(r"-+", "-", s).strip("-")[:60]
 
 
+def append_session_note(project: Project, session_type: str, summary: str) -> None:
+    """Append a dated session entry under ## Notes in the project note."""
+    if not project.path or not project.path.exists():
+        return
+    text = project.path.read_text()
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = f"- **{session_type}**: {summary}"
+
+    # Find ## Notes section
+    notes_match = re.search(r"^## Notes\s*$", text, re.MULTILINE)
+    if not notes_match:
+        # No ## Notes section — append one
+        text = text.rstrip() + f"\n\n## Notes\n### {today}\n{entry}\n"
+        project.path.write_text(text)
+        return
+
+    notes_start = notes_match.end()
+
+    # Check if ### {today} subsection already exists
+    today_pattern = re.compile(rf"^### {re.escape(today)}\s*$", re.MULTILINE)
+    today_match = today_pattern.search(text, notes_start)
+    if today_match:
+        # Find the end of this subsection (next ### or ## or end of file)
+        next_heading = re.search(r"^##", text[today_match.end():], re.MULTILINE)
+        if next_heading:
+            insert_pos = today_match.end() + next_heading.start()
+        else:
+            insert_pos = len(text)
+        # Insert entry before the next heading (or at end)
+        text = text[:insert_pos].rstrip() + f"\n{entry}\n" + text[insert_pos:]
+    else:
+        # Insert new ### {today} heading right after ## Notes
+        text = text[:notes_start] + f"\n### {today}\n{entry}\n" + text[notes_start:]
+
+    project.path.write_text(text)
+
+
 # ---------------------------------------------------------------------------
 # tmux helpers
 # ---------------------------------------------------------------------------
@@ -437,6 +484,28 @@ def tmux_sessions() -> list[str]:
     if result.returncode != 0:
         return []
     return result.stdout.strip().splitlines()
+
+
+def tmux_session_alive(name: str) -> bool:
+    """Check if a tmux session has any live (non-dead) panes."""
+    result = subprocess.run(
+        ["tmux", "list-panes", "-t", name, "-F", "#{pane_dead}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    return any(line.strip() == "0" for line in result.stdout.strip().splitlines())
+
+
+def cleanup_stale_sessions(cfg: Config) -> None:
+    """Clear dev_port/dev_session for projects whose tmux session is gone."""
+    active = tmux_sessions()
+    for proj in load_projects(cfg):
+        if proj.dev_session and proj.dev_session not in active:
+            proj.dev_port = 0
+            proj.dev_session = ""
+            update_project_note(proj)
 
 
 def is_port_free(port: int) -> bool:
@@ -496,6 +565,7 @@ def dashboard(ctx: typer.Context):
     if ctx.invoked_subcommand is not None:
         return
     cfg = load_config()
+    cleanup_stale_sessions(cfg)
     projects = load_projects(cfg)
     if not projects:
         console.print("[dim]No projects found. Run [bold]wb sync[/bold] to pull issues.[/dim]")
@@ -531,18 +601,35 @@ def dashboard(ctx: typer.Context):
             s for s in active_sessions
             if s.startswith(f"wb-{p.slug}") and s != f"wb-{p.slug}-dev"
         ]
-        tmux_info = " ".join(f"[green]{s}[/green]" for s in tmux_matches)
+        tmux_parts = []
+        for s in tmux_matches:
+            if tmux_session_alive(s):
+                tmux_parts.append(f"[green]{s}[/green]")
+            else:
+                tmux_parts.append(f"[yellow]{s} (done)[/yellow]")
+        tmux_info = " ".join(tmux_parts)
 
         dev_info = ""
         if p.dev_port and p.dev_session and p.dev_session in active_sessions:
-            dev_info = f"[cyan]:{p.dev_port}[/cyan]"
+            if not is_port_free(p.dev_port):
+                dev_info = f"[cyan]:{p.dev_port}[/cyan]"
+            else:
+                dev_info = f"[yellow]:{p.dev_port}?[/yellow]"
 
         url = p.obsidian_url(cfg)
         status = p.derived_status
         color = STATUS_COLORS.get(status, "white")
+
+        # Show current stage name when implementing
+        status_display = status
+        if status == "implementing" and p.stages:
+            running = next((s for s in p.stages if s.status == "running"), None)
+            if running:
+                status_display = f"implementing ({running.name})"
+
         table.add_row(
             f"[link={url}]{p.slug}[/link]",
-            f"[{color}]{status}[/{color}]",
+            f"[{color}]{status_display}[/{color}]",
             p.stage_progress(),
             branch or "[dim]—[/dim]",
             tmux_info or "[dim]—[/dim]",
@@ -772,8 +859,7 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Launching planning session for: {proj.title}[/bold]")
     console.print("[dim]Chat with Claude to refine the plan. Exit when done.[/dim]\n")
 
-    os.execvp(
-        "claude",
+    subprocess.run(
         [
             "claude",
             "--dangerously-skip-permissions",
@@ -784,6 +870,9 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
             initial_msg,
         ],
     )
+
+    append_session_note(proj, "plan", f"Planning session for {proj.title}")
+    update_project_note(proj)
 
 
 @app.command("stage")
@@ -1135,6 +1224,8 @@ def _implement_interactive_staged(
         env=_clean_env(),
     )
 
+    append_session_note(proj, "implement", f"Stage {stage.id} ({stage.name}) implementation completed")
+
     # Codex review with stage context
     stage_ctx = f"Reviewing stage {stage.id}: {stage.name}"
     if plan_content:
@@ -1215,6 +1306,8 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
         cwd=sandbox_path,
         env=_clean_env(),
     )
+
+    append_session_note(proj, "implement", f"Implementation session for {proj.title}")
 
     # Codex review
     _codex_review(cfg, proj, sandbox_path)
@@ -1309,6 +1402,28 @@ p.write_text(text)
 
         claude --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Commit your work. When done, append a dated Notes entry to the Obsidian project note (path is in CLAUDE.md). NEVER write summary/notes/review files into the codebase."
 
+        python3 -c "
+import re
+from datetime import datetime
+from pathlib import Path
+p = Path('{project_note_path}')
+text = p.read_text()
+today = datetime.now().strftime('%Y-%m-%d')
+entry = '- **implement**: Background implementation completed for {proj.title}'
+notes_match = re.search(r'^## Notes\\s*$', text, re.MULTILINE)
+if notes_match:
+    import re as _re
+    today_pat = _re.compile(r'^### ' + _re.escape(today) + r'\\s*$', _re.MULTILINE)
+    tm = today_pat.search(text, notes_match.end())
+    if tm:
+        next_h = _re.search(r'^##', text[tm.end():], _re.MULTILINE)
+        pos = tm.end() + next_h.start() if next_h else len(text)
+        text = text[:pos].rstrip() + '\\n' + entry + '\\n' + text[pos:]
+    else:
+        text = text[:notes_match.end()] + '\\n### ' + today + '\\n' + entry + '\\n' + text[notes_match.end():]
+    p.write_text(text)
+"
+
         echo "=== wb: Implementation done, starting Codex review ({CODEX_MODEL}) ==="
 
         python3 -c "
@@ -1321,6 +1436,28 @@ p.write_text(text)
 "
 
         codex exec --dangerously-bypass-approvals-and-sandbox -m {CODEX_MODEL} '{codex_review_prompt_escaped}'
+
+        python3 -c "
+import re
+from datetime import datetime
+from pathlib import Path
+p = Path('{project_note_path}')
+text = p.read_text()
+today = datetime.now().strftime('%Y-%m-%d')
+entry = '- **review**: Codex ({CODEX_MODEL}) code review completed'
+notes_match = re.search(r'^## Notes\\s*$', text, re.MULTILINE)
+if notes_match:
+    import re as _re
+    today_pat = _re.compile(r'^### ' + _re.escape(today) + r'\\s*$', _re.MULTILINE)
+    tm = today_pat.search(text, notes_match.end())
+    if tm:
+        next_h = _re.search(r'^##', text[tm.end():], _re.MULTILINE)
+        pos = tm.end() + next_h.start() if next_h else len(text)
+        text = text[:pos].rstrip() + '\\n' + entry + '\\n' + text[pos:]
+    else:
+        text = text[:notes_match.end()] + '\\n### ' + today + '\\n' + entry + '\\n' + text[notes_match.end():]
+    p.write_text(text)
+"
 
         echo "=== wb: Codex review complete ==="
 
@@ -1586,8 +1723,7 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Chatting about: {proj.title}[/bold]")
     console.print("[dim]Informal Claude session with project context.[/dim]\n")
 
-    os.execvp(
-        "claude",
+    subprocess.run(
         [
             "claude",
             "--dangerously-skip-permissions",
@@ -1596,6 +1732,8 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
             initial_msg,
         ],
     )
+
+    append_session_note(proj, "chat", f"Chat session about {proj.title}")
 
 
 @app.command()
