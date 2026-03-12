@@ -63,6 +63,7 @@ def _clean_env() -> dict[str, str]:
 app = typer.Typer(
     invoke_without_command=True,
     no_args_is_help=False,
+    add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 console = Console()
@@ -167,6 +168,7 @@ class Project:
     tags: list[str] = field(default_factory=list)
     github_issues: list[str] = field(default_factory=list)
     github_prs: list[str] = field(default_factory=list)
+    pr_title: str = ""
     sandbox: str = ""
     branch: str = ""
     related_notes: list[str] = field(default_factory=list)
@@ -525,14 +527,11 @@ def dashboard(ctx: typer.Context):
         if branch and len(branch) > 28:
             branch = branch[:25] + "..."
 
-        tmux_info = ""
-        if p.derived_status in ("implementing", "reviewing"):
-            sess_name = f"wb-{p.slug}"
-            if sess_name in active_sessions:
-                tmux_info = f"[green]{sess_name}[/green]"
-            review_sess = f"wb-{p.slug}-review"
-            if review_sess in active_sessions:
-                tmux_info = f"[green]{review_sess}[/green]"
+        tmux_matches = [
+            s for s in active_sessions
+            if s.startswith(f"wb-{p.slug}") and s != f"wb-{p.slug}-dev"
+        ]
+        tmux_info = " ".join(f"[green]{s}[/green]" for s in tmux_matches)
 
         dev_info = ""
         if p.dev_port and p.dev_session and p.dev_session in active_sessions:
@@ -1044,14 +1043,14 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context:
         4. Run tests: `{cfg.test_cmd}`
         5. Run lint: `{cfg.lint_cmd}`
         6. Fix any issues you find and commit fixes with clear messages
-        7. When done, write `.wb-review.md` summarizing your findings and any fixes made
+        7. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
+
+        IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
     """)
 
     subprocess.run(
         [
             "codex",
-            "exec",
-            "--dangerously-bypass-approvals-and-sandbox",
             "-m",
             CODEX_MODEL,
             "-C",
@@ -1065,7 +1064,6 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context:
 
     proj.status = "reviewed"
     update_project_note(proj)
-    notify("wb", f"AI review complete for {proj.slug} — ready for your review")
 
 
 def _implement_interactive_staged(
@@ -1247,7 +1245,9 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         4. Run lint: `{cfg.lint_cmd}`
         5. Fix any failures
         6. Commit your work with clear commit messages
-        7. When fully done, write `.wb-summary.md` with a summary of what you did
+        7. When fully done, append a dated `### YYYY-MM-DD` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing what you implemented, key decisions, and any issues encountered
+
+        IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
 
         ## Project Note
         {note_content}
@@ -1278,7 +1278,9 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         4. Run tests: `{cfg.test_cmd}`
         5. Run lint: `{cfg.lint_cmd}`
         6. Fix any issues you find and commit fixes with clear messages
-        7. Write `.wb-review.md` summarizing your findings and any fixes made
+        7. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
+
+        IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
     """)
     codex_review_prompt_escaped = codex_review_prompt.replace("'", "'\\''")
 
@@ -1305,7 +1307,7 @@ text = re.sub(r'status: \\w[\\w-]*', 'status: implementing', text, count=1)
 p.write_text(text)
 "
 
-        claude --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Commit your work. Write .wb-summary.md when done."
+        claude --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Commit your work. When done, append a dated Notes entry to the Obsidian project note (path is in CLAUDE.md). NEVER write summary/notes/review files into the codebase."
 
         echo "=== wb: Implementation done, starting Codex review ({CODEX_MODEL}) ==="
 
@@ -1384,16 +1386,40 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
         console.print("[red]Sandbox not found[/red]")
         raise typer.Exit(1)
 
+    # Build PR summary from the Notes section of the Obsidian project note
     summary = ""
-    summary_path = sandbox_path / ".wb-summary.md"
-    review_path = sandbox_path / ".wb-review.md"
-    if summary_path.exists():
-        summary += summary_path.read_text()
-    if review_path.exists():
-        summary += "\n\n---\n\n## Review Notes\n\n" + review_path.read_text()
-
-    if not summary.strip():
+    if proj.path and proj.path.exists():
+        note_text = proj.path.read_text()
+        notes_match = re.search(r"^## Notes\s*\n(.*)", note_text, re.DOTALL | re.MULTILINE)
+        if notes_match:
+            summary = notes_match.group(1).strip()
+    if not summary:
         summary = f"Implementation of: {proj.title}"
+
+    # Safety check: warn if any wb working files ended up tracked in git
+    wb_files = list(sandbox_path.glob(".wb-*.md")) + list(sandbox_path.glob(".wb-*.sh"))
+    tracked_wb_files = []
+    for f in wb_files:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(f)],
+            cwd=sandbox_path,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            tracked_wb_files.append(str(f))
+    if tracked_wb_files:
+        console.print(
+            f"[red bold]ERROR: {len(tracked_wb_files)} wb working file(s) are tracked in git:[/red bold]"
+        )
+        for f in tracked_wb_files:
+            console.print(f"  [red]{f}[/red]")
+        console.print("[red]These must not be in the codebase. Removing from git and committing...[/red]")
+        subprocess.run(["git", "rm", "--cached", *tracked_wb_files], cwd=sandbox_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "chore: remove accidentally tracked wb working files"],
+            cwd=sandbox_path,
+            check=True,
+        )
 
     console.print(f"[bold]Pushing branch {proj.branch}...[/bold]")
     subprocess.run(
@@ -1403,7 +1429,43 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
     )
 
     console.print("[bold]Creating PR...[/bold]")
-    pr_title = proj.title
+    # Use pr_title from frontmatter, or prompt for a conventional commit title
+    if proj.pr_title:
+        pr_title = proj.pr_title
+    else:
+        # Infer a default conventional commit title from project metadata
+        _TAG_TO_TYPE = {
+            "bug": "fix",
+            "bugfix": "fix",
+            "fix": "fix",
+            "docs": "docs",
+            "documentation": "docs",
+            "refactor": "refactor",
+            "perf": "perf",
+            "performance": "perf",
+            "test": "test",
+            "tests": "test",
+            "ci": "ci",
+            "build": "build",
+            "style": "style",
+            "chore": "chore",
+        }
+        cc_type = "feat"
+        for tag in proj.tags:
+            if tag.lower() in _TAG_TO_TYPE:
+                cc_type = _TAG_TO_TYPE[tag.lower()]
+                break
+        # Use first tag that looks like a scope (not a type keyword)
+        scope_candidates = [t for t in proj.tags if t.lower() not in _TAG_TO_TYPE]
+        scope = f"({scope_candidates[0]})" if scope_candidates else ""
+        default_title = f"{cc_type}{scope}: {proj.title.lower()}"
+        if len(default_title) > 70:
+            default_title = default_title[:67] + "..."
+        console.print(
+            "[dim]PR title must follow conventional commits "
+            "(e.g. feat(scope): description, fix: description)[/dim]"
+        )
+        pr_title = typer.prompt("PR title", default=default_title)
     if len(pr_title) > 70:
         pr_title = pr_title[:67] + "..."
 
@@ -1537,6 +1599,20 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
 
 
 @app.command()
+def review(project: str = typer.Argument(autocompletion=complete_project)):
+    """Run interactive Codex code review on a project sandbox."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    if not proj.sandbox or not Path(proj.sandbox).exists():
+        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
+        raise typer.Exit(1)
+
+    sandbox_path = Path(proj.sandbox)
+    _codex_review(cfg, proj, sandbox_path)
+
+
+@app.command()
 def cursor(project: str = typer.Argument(autocompletion=complete_project)):
     """Open project sandbox in Cursor with changed files."""
     cfg = load_config()
@@ -1548,16 +1624,27 @@ def cursor(project: str = typer.Argument(autocompletion=complete_project)):
 
     sandbox_path = Path(proj.sandbox)
 
-    # Get changed files relative to main
+    # Get files changed in this branch since diverging from main (committed + uncommitted)
+    changed = set()
+    # Committed changes on this branch
     result = subprocess.run(
-        ["git", "diff", "--name-only", "main"],
+        ["git", "diff", "--name-only", "main...HEAD"],
         cwd=sandbox_path,
         capture_output=True,
         text=True,
     )
-    changed_files = []
     if result.returncode == 0 and result.stdout.strip():
-        changed_files = result.stdout.strip().splitlines()
+        changed.update(result.stdout.strip().splitlines())
+    # Uncommitted changes (staged + unstaged)
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"],
+        cwd=sandbox_path,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        changed.update(result.stdout.strip().splitlines())
+    changed_files = sorted(changed)
 
     cmd = ["cursor", str(sandbox_path)] + changed_files
     console.print(f"[green]Opening {proj.slug} in Cursor[/green]")
