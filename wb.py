@@ -1529,22 +1529,57 @@ p.write_text(text)
 
 
 @app.command()
-def approve(project: str = typer.Argument(autocompletion=complete_project)):
+def approve(
+    project: str = typer.Argument(autocompletion=complete_project),
+    stage: int = typer.Option(None, "--stage", "-s", help="Stage ID to approve (auto-detects first 'reviewed' stage if omitted)"),
+):
     """Create PR and launch CI monitor after review."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
+    # For staged projects, resolve which stage is being approved
+    approving_stage: Stage | None = None
+    if proj.stages:
+        if stage is not None:
+            approving_stage = proj.get_stage(stage)
+            if not approving_stage:
+                console.print(f"[red]Stage {stage} not found[/red]")
+                raise typer.Exit(1)
+            if approving_stage.status != "reviewed":
+                console.print(
+                    f"[red]Stage {stage} ({approving_stage.name}) status is "
+                    f"'{approving_stage.status}', expected 'reviewed'[/red]"
+                )
+                raise typer.Exit(1)
+        else:
+            # Auto-detect first reviewed stage
+            reviewed = [s for s in proj.stages if s.status == "reviewed"]
+            if reviewed:
+                approving_stage = reviewed[0]
+                console.print(
+                    f"[dim]Auto-detected stage {approving_stage.id}: "
+                    f"{approving_stage.name}[/dim]"
+                )
+
     _pr_active = ("pr-open", "ci-checking", "ci-failing", "ci-passing", "pr-approved")
-    if proj.status not in ("reviewed", "awaiting-approval"):
+    if approving_stage:
+        # For stage-level approval, allow project to be "implementing"
         if proj.status in _pr_active:
             console.print(f"[yellow]PR already open for {proj.slug} ({proj.status})[/yellow]")
             if proj.github_prs:
                 console.print(f"  {proj.github_prs[-1]}")
             raise typer.Exit(0)
-        console.print(
-            f"[red]Project status is '{proj.status}', expected 'reviewed' or 'awaiting-approval'[/red]"
-        )
-        raise typer.Exit(1)
+    else:
+        if proj.status not in ("reviewed", "awaiting-approval"):
+            if proj.status in _pr_active:
+                console.print(f"[yellow]PR already open for {proj.slug} ({proj.status})[/yellow]")
+                if proj.github_prs:
+                    console.print(f"  {proj.github_prs[-1]}")
+                raise typer.Exit(0)
+            console.print(
+                f"[red]Project status is '{proj.status}', expected 'reviewed' or 'awaiting-approval'[/red]"
+            )
+            raise typer.Exit(1)
 
     proj.status = "awaiting-approval"
     update_project_note(proj)
@@ -1626,7 +1661,8 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
         # Use first tag that looks like a scope (not a type keyword)
         scope_candidates = [t for t in proj.tags if t.lower() not in _TAG_TO_TYPE]
         scope = f"({scope_candidates[0]})" if scope_candidates else ""
-        default_title = f"{cc_type}{scope}: {proj.title.lower()}"
+        stage_suffix = f" (stage {approving_stage.id}: {approving_stage.name.lower()})" if approving_stage else ""
+        default_title = f"{cc_type}{scope}: {proj.title.lower()}{stage_suffix}"
         if len(default_title) > 70:
             default_title = default_title[:67] + "..."
         console.print(
@@ -1639,7 +1675,13 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
 
     issue_refs = ""
     if proj.github_issues:
-        issue_refs = "\n\nCloses " + ", ".join(
+        # Use "Part of" for stage PRs with remaining stages, "Closes" for final
+        remaining = approving_stage and any(
+            s.status not in ("done", "skipped") and s.id != approving_stage.id
+            for s in proj.stages
+        )
+        verb = "Part of" if remaining else "Closes"
+        issue_refs = f"\n\n{verb} " + ", ".join(
             f"#{ref.split('#')[-1]}" if "#" in ref else ref for ref in proj.github_issues
         )
 
@@ -1664,6 +1706,56 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
 
     sess_name = f"wb-{proj.slug}-ci"
     project_note_path = str(proj.path) if proj.path else ""
+
+    # Build the merge handler based on whether this is a stage-level approval
+    if approving_stage:
+        merge_handler = f'''
+                echo "=== wb: PR merged! ==="
+                python3 -c "
+import yaml, re
+from pathlib import Path
+p = Path('{project_note_path}')
+text = p.read_text()
+m = re.match(r'^---\\n(.+?)\\n---', text, re.DOTALL)
+if m:
+    fm = yaml.safe_load(m.group(1))
+    body = text[m.end():]
+    # Mark this stage done
+    for s in fm.get('stages', []):
+        if s['id'] == {approving_stage.id}:
+            s['status'] = 'done'
+    # Activate next pending stage whose deps are met
+    done_ids = {{s['id'] for s in fm.get('stages', []) if s['status'] in ('done', 'skipped')}}
+    for s in sorted(fm.get('stages', []), key=lambda x: x['id']):
+        if s['status'] == 'pending' and all(d in done_ids for d in s.get('depends_on', [])):
+            s['status'] = 'running'
+            break
+    # Derive project status
+    if all(s['status'] in ('done', 'skipped') for s in fm.get('stages', [])):
+        fm['status'] = 'archived'
+    else:
+        fm['status'] = 'implementing'
+    new_fm = yaml.dump(fm, default_flow_style=False, sort_keys=False)
+    p.write_text('---\\n' + new_fm + '---\\n' + body)
+"
+                osascript -e 'display notification "Stage {approving_stage.id} merged!" with title "wb: {proj.slug}"'
+                break'''
+    else:
+        merge_handler = f'''
+                echo "=== wb: PR merged! ==="
+                tmux kill-session -t "wb-{proj.slug}-dev" 2>/dev/null || true
+                python3 -c "
+import re
+from pathlib import Path
+p = Path('{project_note_path}')
+text = p.read_text()
+text = re.sub(r'status: \\w[\\w-]*', 'status: archived', text, count=1)
+text = re.sub(r'\\ndev_port:.*', '', text)
+text = re.sub(r'\\ndev_session:.*', '', text)
+p.write_text(text)
+"
+                osascript -e 'display notification "PR merged!" with title "wb: {proj.slug}"'
+                break'''
 
     ci_script = textwrap.dedent(f"""\
         #!/bin/bash
@@ -1690,20 +1782,7 @@ p.write_text(text)
             state=$(gh pr view --repo {cfg.github_repo} --json state -q '.state' 2>/dev/null || echo "unknown")
 
             if [ "$state" = "MERGED" ]; then
-                echo "=== wb: PR merged! ==="
-                tmux kill-session -t "wb-{proj.slug}-dev" 2>/dev/null || true
-                python3 -c "
-import re
-from pathlib import Path
-p = Path('{project_note_path}')
-text = p.read_text()
-text = re.sub(r'status: \\w[\\w-]*', 'status: archived', text, count=1)
-text = re.sub(r'\\ndev_port:.*', '', text)
-text = re.sub(r'\\ndev_session:.*', '', text)
-p.write_text(text)
-"
-                osascript -e 'display notification "PR merged!" with title "wb: {proj.slug}"'
-                break
+{merge_handler}
             fi
 
             # Check review/approval status
