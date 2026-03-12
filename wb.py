@@ -27,6 +27,9 @@ import typer
 import yaml
 from rich.console import Console
 from rich.table import Table
+from typer._completion_classes import completion_init
+
+completion_init()
 
 
 def _clean_env() -> dict[str, str]:
