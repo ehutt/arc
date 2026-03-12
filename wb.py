@@ -79,6 +79,10 @@ STATUSES = [
     "reviewed",
     "awaiting-approval",
     "pr-open",
+    "ci-checking",
+    "ci-failing",
+    "ci-passing",
+    "pr-approved",
     "archived",
 ]
 
@@ -90,6 +94,10 @@ STATUS_COLORS = {
     "reviewed": "cyan",
     "awaiting-approval": "cyan",
     "pr-open": "magenta",
+    "ci-checking": "magenta",
+    "ci-failing": "red",
+    "ci-passing": "green",
+    "pr-approved": "green",
     "archived": "dim",
 }
 
@@ -280,10 +288,11 @@ def derive_project_status(stages: list[Stage], manual_status: str = "") -> str:
         stage_status = "implementing"
 
     # Allow manual lifecycle overrides for post-completion states
-    if manual_status in ("reviewing", "awaiting-approval", "pr-open", "archived"):
+    _ci_statuses = ("ci-checking", "ci-failing", "ci-passing", "pr-approved")
+    if manual_status in ("reviewing", "awaiting-approval", "pr-open", *_ci_statuses, "archived"):
         if manual_status == "reviewing" and stage_status in ("implementing", "reviewed"):
             return "reviewing"
-        if manual_status in ("awaiting-approval", "pr-open", "archived") and stage_status == "reviewed":
+        if manual_status in ("awaiting-approval", "pr-open", *_ci_statuses, "archived") and stage_status == "reviewed":
             return manual_status
     return stage_status
 
@@ -378,7 +387,8 @@ def update_project_note(project: Project) -> None:
     m = re.match(r"^---\n.+?\n---\n?", text, re.DOTALL)
     body = text[m.end() :] if m else text
     project.updated = datetime.now().strftime("%Y-%m-%d")
-    if project.stages and project.status not in ("awaiting-approval", "pr-open", "archived"):
+    _no_derive = ("awaiting-approval", "pr-open", "ci-checking", "ci-failing", "ci-passing", "pr-approved", "archived")
+    if project.stages and project.status not in _no_derive:
         project.status = derive_project_status(project.stages, project.status)
     fm = yaml.dump(project.frontmatter_dict(), default_flow_style=False, sort_keys=False)
     project.path.write_text(f"---\n{fm}---\n{body}")
@@ -766,7 +776,8 @@ def sync():
                     pr_ref = pr["url"]
                     if pr_ref not in p.github_prs:
                         p.github_prs.append(pr_ref)
-                        if p.status not in ("pr-open", "archived"):
+                        _pr_statuses = ("pr-open", "ci-checking", "ci-failing", "ci-passing", "pr-approved", "archived")
+                        if p.status not in _pr_statuses:
                             p.status = "pr-open"
                         update_project_note(p)
                         console.print(f"  Updated {p.slug} with PR #{pr['number']}")
@@ -1507,9 +1518,10 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
     cfg = load_config()
     proj = find_project(cfg, project)
 
+    _pr_active = ("pr-open", "ci-checking", "ci-failing", "ci-passing", "pr-approved")
     if proj.status not in ("reviewed", "awaiting-approval"):
-        if proj.status == "pr-open":
-            console.print(f"[yellow]PR already open for {proj.slug}[/yellow]")
+        if proj.status in _pr_active:
+            console.print(f"[yellow]PR already open for {proj.slug} ({proj.status})[/yellow]")
             if proj.github_prs:
                 console.print(f"  {proj.github_prs[-1]}")
             raise typer.Exit(0)
@@ -1630,7 +1642,7 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
     pr_url = result.stdout.strip()
     console.print(f"[green]PR created: {pr_url}[/green]")
 
-    proj.status = "pr-open"
+    proj.status = "ci-checking"
     proj.github_prs.append(pr_url)
     update_project_note(proj)
 
@@ -1642,6 +1654,19 @@ def approve(project: str = typer.Argument(autocompletion=complete_project)):
         cd "{sandbox_path}"
 
         echo "=== wb: Monitoring CI for {proj.slug} ==="
+
+        set_status() {{
+            python3 -c "
+import re
+from pathlib import Path
+p = Path('{project_note_path}')
+text = p.read_text()
+text = re.sub(r'status: \\w[\\w-]*', 'status: $1', text, count=1)
+p.write_text(text)
+"
+        }}
+
+        prev_status=""
 
         while true; do
             sleep 60
@@ -1665,16 +1690,43 @@ p.write_text(text)
                 break
             fi
 
+            # Check review/approval status
+            review_decision=$(gh pr view --repo {cfg.github_repo} --json reviewDecision -q '.reviewDecision' 2>/dev/null || echo "")
+
             checks=$(gh pr checks --repo {cfg.github_repo} 2>/dev/null || echo "pending")
 
-            if echo "$checks" | grep -q "fail"; then
-                echo "=== wb: CI failure detected, launching fix agent ==="
-                claude --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Commit and push."
+            # Determine current status
+            if [ "$review_decision" = "APPROVED" ]; then
+                new_status="pr-approved"
+            elif echo "$checks" | grep -qi "fail"; then
+                new_status="ci-failing"
+            elif echo "$checks" | grep -qi "pass"; then
+                new_status="ci-passing"
+            else
+                new_status="ci-checking"
             fi
 
-            if echo "$checks" | grep -q "pass"; then
-                echo "=== wb: CI passing ==="
-                osascript -e 'display notification "CI is passing" with title "wb: {proj.slug}"'
+            # Only update + notify on status change
+            if [ "$new_status" != "$prev_status" ]; then
+                echo "=== wb: status -> $new_status ==="
+                set_status "$new_status"
+
+                case "$new_status" in
+                    ci-failing)
+                        osascript -e 'display notification "CI failing — launching fix agent" with title "wb: {proj.slug}"'
+                        claude --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Commit and push."
+                        # After fix attempt, reset so next loop re-evaluates
+                        prev_status=""
+                        continue
+                        ;;
+                    ci-passing)
+                        osascript -e 'display notification "CI passing" with title "wb: {proj.slug}"'
+                        ;;
+                    pr-approved)
+                        osascript -e 'display notification "PR approved!" with title "wb: {proj.slug}"'
+                        ;;
+                esac
+                prev_status="$new_status"
             fi
         done
     """)
