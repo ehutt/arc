@@ -1152,7 +1152,7 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context:
         3. Check for edge cases, code quality, and adherence to the plan
         4. Run tests: `{cfg.test_cmd}`
         5. Run lint: `{cfg.lint_cmd}`
-        6. Fix any issues you find and commit fixes with clear messages
+        6. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
         7. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
 
         IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
@@ -1232,6 +1232,9 @@ def _implement_interactive_staged(
         Project sandbox: {sandbox_path}
         Branch: {proj.branch}
 
+        ## Git
+        Use git to track your changes. After every meaningful change, stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
+
         When you've completed all steps, tell the user.
     """)
 
@@ -1308,6 +1311,9 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
         Project sandbox: {sandbox_path}
         Branch: {proj.branch}
 
+        ## Git
+        Use git to track your changes. After every meaningful change, stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
+
         When you've completed all tasks, tell the user.
     """)
 
@@ -1360,7 +1366,7 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         3. Run tests: `{cfg.test_cmd}`
         4. Run lint: `{cfg.lint_cmd}`
         5. Fix any failures
-        6. Commit your work with clear commit messages
+        6. Commit your work after every meaningful change: stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
         7. When fully done, append a dated `### YYYY-MM-DD` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing what you implemented, key decisions, and any issues encountered
 
         IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
@@ -1393,7 +1399,7 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         3. Check for edge cases, code quality, and adherence to the plan
         4. Run tests: `{cfg.test_cmd}`
         5. Run lint: `{cfg.lint_cmd}`
-        6. Fix any issues you find and commit fixes with clear messages
+        6. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
         7. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
 
         IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
@@ -1424,7 +1430,7 @@ text = re.sub(r'status: \\w[\\w-]*', 'status: implementing', text, count=1)
 p.write_text(text)
 "
 
-        claude --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Commit your work. When done, append a dated Notes entry to the Obsidian project note (path is in CLAUDE.md). NEVER write summary/notes/review files into the codebase."
+        claude --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Track your changes with git: after every meaningful change, stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Before finishing, commit any remaining modified files. When done, append a dated Notes entry to the Obsidian project note (path is in CLAUDE.md). NEVER write summary/notes/review files into the codebase."
 
         python3 -c "
 import re
@@ -1724,7 +1730,7 @@ p.write_text(text)
                 case "$new_status" in
                     ci-failing)
                         osascript -e 'display notification "CI failing — launching fix agent" with title "wb: {proj.slug}"'
-                        claude --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Commit and push."
+                        claude --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Push."
                         # After fix attempt, reset so next loop re-evaluates
                         prev_status=""
                         continue
