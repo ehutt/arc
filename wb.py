@@ -32,6 +32,11 @@ from typer._completion_classes import completion_init
 completion_init()
 
 
+def _set_project_env(proj: Project) -> None:
+    """Set WB_PROJECT_SLUG so Claude hooks can identify the project."""
+    os.environ["WB_PROJECT_SLUG"] = proj.slug
+
+
 def _clean_env() -> dict[str, str]:
     """Return a copy of os.environ with conda/virtualenv vars stripped.
 
@@ -873,6 +878,7 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Launching planning session for: {proj.title}[/bold]")
     console.print("[dim]Chat with Claude to refine the plan. Exit when done.[/dim]\n")
 
+    _set_project_env(proj)
     subprocess.run(
         [
             "claude",
@@ -956,6 +962,7 @@ def stage_cmd(
         initial_msg = f"Read the project note at {proj.path} and let's plan stage {s.id}: {s.name}"
 
         console.print(f"[bold]Planning stage {s.id}: {s.name}[/bold]")
+        _set_project_env(proj)
         os.execvp(
             "claude",
             [
@@ -1231,6 +1238,7 @@ def _implement_interactive_staged(
     console.print(f"[bold]Implementing stage {stage.id}: {stage.name}[/bold]")
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
 
+    _set_project_env(proj)
     initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
     subprocess.run(
         ["claude", "--dangerously-skip-permissions", "--system-prompt", system_prompt, initial_msg],
@@ -1309,6 +1317,7 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
     console.print(f"[bold]Implementing: {proj.title}[/bold]")
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
 
+    _set_project_env(proj)
     subprocess.run(
         [
             "claude",
@@ -1397,6 +1406,7 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         #!/bin/bash
         set -e
         cd "{sandbox_path}"
+        export WB_PROJECT_SLUG="{proj.slug}"
 
         # Strip conda/virtualenv env vars to avoid package resolution issues
         unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_SHLVL CONDA_EXE
@@ -1778,6 +1788,7 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Chatting about: {proj.title}[/bold]")
     console.print("[dim]Informal Claude session with project context.[/dim]\n")
 
+    _set_project_env(proj)
     subprocess.run(
         [
             "claude",
