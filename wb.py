@@ -603,14 +603,15 @@ def dashboard(ctx: typer.Context):
 
     active_sessions = tmux_sessions()
 
-    table = Table(show_header=True, header_style="bold", padding=(0, 2), expand=True)
-    table.add_column("Project", style="bold", ratio=3)
-    table.add_column("Stage", ratio=3)
-    table.add_column("Progress", ratio=1)
-    table.add_column("PR", ratio=1)
-    table.add_column("Branch", ratio=3, no_wrap=True, overflow="ellipsis")
-    table.add_column("Sessions", ratio=2, no_wrap=True, overflow="ellipsis")
-    table.add_column("Updated", justify="right", ratio=1)
+    term_width = min(console.width, 140)
+    table = Table(show_header=True, header_style="bold", padding=(0, 2), width=term_width)
+    table.add_column("Project", style="bold", no_wrap=True)
+    table.add_column("Stage", no_wrap=True)
+    table.add_column("Progress", no_wrap=True)
+    table.add_column("PR", no_wrap=True)
+    table.add_column("Branch", no_wrap=True, overflow="ellipsis", max_width=30)
+    table.add_column("Sessions", no_wrap=True)
+    table.add_column("Updated", justify="right", no_wrap=True)
 
     status_order = {s: i for i, s in enumerate(STATUSES)}
     projects.sort(
