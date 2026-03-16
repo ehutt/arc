@@ -603,15 +603,14 @@ def dashboard(ctx: typer.Context):
 
     active_sessions = tmux_sessions()
 
-    table = Table(show_header=True, header_style="bold", padding=(0, 2))
-    table.add_column("Project", style="bold", min_width=20)
-    table.add_column("Stage")
-    table.add_column("Progress")
-    table.add_column("PR")
-    table.add_column("Branch", max_width=30, no_wrap=True, overflow="ellipsis")
-    table.add_column("Tmux", max_width=25, no_wrap=True, overflow="ellipsis")
-    table.add_column("Dev", max_width=12, no_wrap=True, overflow="ellipsis")
-    table.add_column("Updated", justify="right")
+    table = Table(show_header=True, header_style="bold", padding=(0, 2), expand=True)
+    table.add_column("Project", style="bold", ratio=3)
+    table.add_column("Stage", ratio=3)
+    table.add_column("Progress", ratio=1)
+    table.add_column("PR", ratio=1)
+    table.add_column("Branch", ratio=3, no_wrap=True, overflow="ellipsis")
+    table.add_column("Sessions", ratio=2, no_wrap=True, overflow="ellipsis")
+    table.add_column("Updated", justify="right", ratio=1)
 
     status_order = {s: i for i, s in enumerate(STATUSES)}
     projects.sort(
@@ -623,6 +622,8 @@ def dashboard(ctx: typer.Context):
         )
     )
 
+    has_tmux_sessions = False
+
     for p in projects:
         # PR link
         pr_display = "[dim]—[/dim]"
@@ -632,32 +633,35 @@ def dashboard(ctx: typer.Context):
             if pr_match:
                 pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
 
-        # Branch + sandbox cursor link
-        branch = p.branch
-        if branch and len(branch) > 28:
-            branch = branch[:25] + "..."
-        branch_display = branch or "[dim]—[/dim]"
-        if branch and p.sandbox and Path(p.sandbox).exists():
-            branch_display += f" [link=file://{p.sandbox}][cyan](cursor)[/cyan][/link]"
+        # Branch — clickable, opens sandbox in Cursor
+        branch_display = "[dim]—[/dim]"
+        if p.branch:
+            if p.sandbox and Path(p.sandbox).exists():
+                branch_display = f"[link=cursor://file/{p.sandbox}]{p.branch}[/link]"
+            else:
+                branch_display = p.branch
 
+        # Sessions — compact indicators for tmux + dev
+        session_parts = []
         tmux_matches = [
             s for s in active_sessions
             if s.startswith(f"wb-{p.slug}") and s != f"wb-{p.slug}-dev"
         ]
-        tmux_parts = []
         for s in tmux_matches:
+            has_tmux_sessions = True
+            # Extract session type from name: wb-slug -> "impl", wb-slug-ci -> "ci"
+            suffix = s[len(f"wb-{p.slug}"):]
+            label = suffix.lstrip("-") if suffix else "impl"
             if tmux_session_alive(s):
-                tmux_parts.append(f"[green]{s}[/green]")
+                session_parts.append(f"[green]{label}[/green]")
             else:
-                tmux_parts.append(f"[yellow]{s} (done)[/yellow]")
-        tmux_info = " ".join(tmux_parts)
-
-        dev_info = ""
+                session_parts.append(f"[yellow]{label}[/yellow]")
         if p.dev_port and p.dev_session and p.dev_session in active_sessions:
             if not is_port_free(p.dev_port):
-                dev_info = f"[cyan]:{p.dev_port}[/cyan]"
+                session_parts.append(f"[cyan]:{p.dev_port}[/cyan]")
             else:
-                dev_info = f"[yellow]:{p.dev_port}?[/yellow]"
+                session_parts.append(f"[yellow]:{p.dev_port}?[/yellow]")
+        session_info = " ".join(session_parts)
 
         url = p.obsidian_url(cfg)
         status = p.derived_status
@@ -676,12 +680,13 @@ def dashboard(ctx: typer.Context):
             p.stage_progress(),
             pr_display,
             branch_display,
-            tmux_info or "[dim]—[/dim]",
-            dev_info or "[dim]—[/dim]",
+            session_info or "[dim]—[/dim]",
             relative_time(p.updated),
         )
 
     console.print(table)
+    if has_tmux_sessions:
+        console.print("[dim]  attach sessions: tmux attach -t wb-<slug>[-ci][/dim]")
 
 
 @app.command(rich_help_panel="Project Management")
