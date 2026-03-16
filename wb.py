@@ -589,10 +589,7 @@ def set_tab_title(title: str) -> None:
 
 
 @app.callback()
-def dashboard(
-    ctx: typer.Context,
-    full: bool = typer.Option(False, "--full", help="Show all columns (Branch, Tmux, Dev)"),
-):
+def dashboard(ctx: typer.Context):
     """wb — project dashboard and scaffolding."""
     if ctx.invoked_subcommand is not None:
         return
@@ -611,10 +608,9 @@ def dashboard(
     table.add_column("Stage")
     table.add_column("Progress")
     table.add_column("PR")
-    if full:
-        table.add_column("Branch", max_width=30, no_wrap=True, overflow="ellipsis")
-        table.add_column("Tmux", max_width=25, no_wrap=True, overflow="ellipsis")
-        table.add_column("Dev", max_width=12, no_wrap=True, overflow="ellipsis")
+    table.add_column("Branch", max_width=30, no_wrap=True, overflow="ellipsis")
+    table.add_column("Tmux", max_width=25, no_wrap=True, overflow="ellipsis")
+    table.add_column("Dev", max_width=12, no_wrap=True, overflow="ellipsis")
     table.add_column("Updated", justify="right")
 
     status_order = {s: i for i, s in enumerate(STATUSES)}
@@ -674,21 +670,16 @@ def dashboard(
             if running:
                 status_display = f"implementing ({running.name})"
 
-        row: list[str] = [
+        table.add_row(
             f"[link={url}]{p.slug}[/link]",
             f"[{color}]{status_display}[/{color}]",
             p.stage_progress(),
             pr_display,
-        ]
-        if full:
-            row.extend([
-                branch_display,
-                tmux_info or "[dim]—[/dim]",
-                dev_info or "[dim]—[/dim]",
-            ])
-        row.append(relative_time(p.updated))
-
-        table.add_row(*row)
+            branch_display,
+            tmux_info or "[dim]—[/dim]",
+            dev_info or "[dim]—[/dim]",
+            relative_time(p.updated),
+        )
 
     console.print(table)
 
