@@ -9,7 +9,7 @@ user = "ehutt"
 repo = "Arize-ai/phoenix"
 
 [agent]
-test_cmd = "tox run -e unit_tests"
+test_cmd = "tox run -e unit_tests -- -n auto"
 lint_cmd = "make lint-python"
 
 [organize]

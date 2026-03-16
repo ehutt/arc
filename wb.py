@@ -250,7 +250,7 @@ class Project:
         if not self.stages:
             return "—"
         done = sum(1 for s in self.stages if s.status == "done")
-        return f"{done}/{len(self.stages)} done"
+        return f"{done}/{len(self.stages)}"
 
     def next_available_stage(self) -> Stage | None:
         done_ids = {s.id for s in self.stages if s.status in ("done", "skipped")}
@@ -573,18 +573,33 @@ def relative_time(date_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def set_tab_title(title: str) -> None:
+    """Set the iTerm/terminal tab title via escape sequence."""
+    sys.stdout.write(f"\033]1;{title}\007")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 
 @app.callback()
-def dashboard(ctx: typer.Context):
+def dashboard(
+    ctx: typer.Context,
+    full: bool = typer.Option(False, "--full", help="Show all columns (Branch, Tmux, Dev)"),
+):
     """wb — project dashboard and scaffolding."""
     if ctx.invoked_subcommand is not None:
         return
     cfg = load_config()
     cleanup_stale_sessions(cfg)
     projects = load_projects(cfg)
+    projects = [p for p in projects if p.derived_status != "archived"]
     if not projects:
         console.print("[dim]No projects found. Run [bold]wb sync[/bold] to pull issues.[/dim]")
         return
@@ -592,12 +607,14 @@ def dashboard(ctx: typer.Context):
     active_sessions = tmux_sessions()
 
     table = Table(show_header=True, header_style="bold", padding=(0, 2))
-    table.add_column("Project", style="bold")
+    table.add_column("Project", style="bold", min_width=20)
     table.add_column("Stage")
     table.add_column("Progress")
-    table.add_column("Branch")
-    table.add_column("Tmux")
-    table.add_column("Dev")
+    table.add_column("PR")
+    if full:
+        table.add_column("Branch", max_width=30, no_wrap=True, overflow="ellipsis")
+        table.add_column("Tmux", max_width=25, no_wrap=True, overflow="ellipsis")
+        table.add_column("Dev", max_width=12, no_wrap=True, overflow="ellipsis")
     table.add_column("Updated", justify="right")
 
     status_order = {s: i for i, s in enumerate(STATUSES)}
@@ -611,9 +628,21 @@ def dashboard(ctx: typer.Context):
     )
 
     for p in projects:
+        # PR link
+        pr_display = "[dim]—[/dim]"
+        if p.github_prs:
+            pr_url = p.github_prs[-1]
+            pr_match = re.search(r"/pull/(\d+)", pr_url)
+            if pr_match:
+                pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
+
+        # Branch + sandbox cursor link
         branch = p.branch
         if branch and len(branch) > 28:
             branch = branch[:25] + "..."
+        branch_display = branch or "[dim]—[/dim]"
+        if branch and p.sandbox and Path(p.sandbox).exists():
+            branch_display += f" [link=file://{p.sandbox}][cyan](cursor)[/cyan][/link]"
 
         tmux_matches = [
             s for s in active_sessions
@@ -645,22 +674,28 @@ def dashboard(ctx: typer.Context):
             if running:
                 status_display = f"implementing ({running.name})"
 
-        table.add_row(
+        row: list[str] = [
             f"[link={url}]{p.slug}[/link]",
             f"[{color}]{status_display}[/{color}]",
             p.stage_progress(),
-            branch or "[dim]—[/dim]",
-            tmux_info or "[dim]—[/dim]",
-            dev_info or "[dim]—[/dim]",
-            relative_time(p.updated),
-        )
+            pr_display,
+        ]
+        if full:
+            row.extend([
+                branch_display,
+                tmux_info or "[dim]—[/dim]",
+                dev_info or "[dim]—[/dim]",
+            ])
+        row.append(relative_time(p.updated))
+
+        table.add_row(*row)
 
     console.print(table)
 
 
-@app.command()
+@app.command(rich_help_panel="Project Management")
 def sync():
-    """Pull GitHub issues, create/attach project notes."""
+    """Pull GitHub issues and sync PR status from the configured repo."""
     cfg = load_config()
     projects = load_projects(cfg)
     existing_issues: set[str] = set()
@@ -796,7 +831,7 @@ def sync():
     console.print("\n[green]Sync complete.[/green]")
 
 
-@app.command()
+@app.command(rich_help_panel="Planning")
 def plan(project: str = typer.Argument(autocompletion=complete_project)):
     """Launch interactive Claude session to plan a project."""
     cfg = load_config()
@@ -878,6 +913,7 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Launching planning session for: {proj.title}[/bold]")
     console.print("[dim]Chat with Claude to refine the plan. Exit when done.[/dim]\n")
 
+    set_tab_title(f"wb: {project} (plan)")
     _set_project_env(proj)
     subprocess.run(
         [
@@ -890,12 +926,13 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
             initial_msg,
         ],
     )
+    set_tab_title("")
 
     append_session_note(proj, "plan", f"Planning session for {proj.title}")
     update_project_note(proj)
 
 
-@app.command("stage")
+@app.command("stage", rich_help_panel="Planning")
 def stage_cmd(
     project: str = typer.Argument(autocompletion=complete_project),
     add: str = typer.Option(None, "--add", help="Add a new stage with this name"),
@@ -1019,9 +1056,9 @@ def stage_cmd(
             console.print(f"  [dim]↳ {s.name} waiting on: {blocking_names}[/dim]")
 
 
-@app.command()
+@app.command(rich_help_panel="Development")
 def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
-    """Create an isolated Phoenix sandbox for a project."""
+    """Create an isolated Phoenix sandbox (worktree clone) for a project."""
     cfg = load_config()
     proj = find_project(cfg, project)
     sandbox_path = cfg.sandbox_root / proj.slug
@@ -1084,7 +1121,7 @@ def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[green]Branch:[/green] {branch_name}")
 
 
-@app.command()
+@app.command(rich_help_panel="Development")
 def implement(
     project: str = typer.Argument(autocompletion=complete_project),
     stage_id: int = typer.Argument(None),
@@ -1147,13 +1184,14 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context:
         {f"## Implementation Plans{plans_context}" if plans_context else ""}
 
         ## Review Instructions
+        Your primary job is a **code quality review**: focus on feature behavior correctness, edge cases, API ergonomics, logic errors, and subtle bugs.
+
         1. Run `git diff main` to see all changes
-        2. Review for correctness against the project requirements and plans above
-        3. Check for edge cases, code quality, and adherence to the plan
-        4. Run tests: `{cfg.test_cmd}`
-        5. Run lint: `{cfg.lint_cmd}`
-        6. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
-        7. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
+        2. Review each changed file for correctness against the project requirements and plans above
+        3. Look for: logic errors, missed edge cases, off-by-one bugs, incorrect API usage, poor error messages, naming issues
+        4. As a secondary check, run tests (`{cfg.test_cmd}`) and lint (`{cfg.lint_cmd}`)
+        5. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
+        6. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
 
         IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
     """)
@@ -1241,6 +1279,7 @@ def _implement_interactive_staged(
     console.print(f"[bold]Implementing stage {stage.id}: {stage.name}[/bold]")
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
 
+    set_tab_title(f"wb: {proj.slug} (impl)")
     _set_project_env(proj)
     initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
     subprocess.run(
@@ -1248,6 +1287,7 @@ def _implement_interactive_staged(
         cwd=sandbox_path,
         env=_clean_env(),
     )
+    set_tab_title("")
 
     append_session_note(proj, "implement", f"Stage {stage.id} ({stage.name}) implementation completed")
 
@@ -1323,6 +1363,7 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
     console.print(f"[bold]Implementing: {proj.title}[/bold]")
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
 
+    set_tab_title(f"wb: {proj.slug} (impl)")
     _set_project_env(proj)
     subprocess.run(
         [
@@ -1335,6 +1376,7 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
         cwd=sandbox_path,
         env=_clean_env(),
     )
+    set_tab_title("")
 
     append_session_note(proj, "implement", f"Implementation session for {proj.title}")
 
@@ -1394,13 +1436,14 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         {f"## Implementation Plans{plans_context}" if plans_context else ""}
 
         ## Review Instructions
+        Your primary job is a **code quality review**: focus on feature behavior correctness, edge cases, API ergonomics, logic errors, and subtle bugs.
+
         1. Run `git diff main` to see all changes
-        2. Review for correctness against the project requirements and plans above
-        3. Check for edge cases, code quality, and adherence to the plan
-        4. Run tests: `{cfg.test_cmd}`
-        5. Run lint: `{cfg.lint_cmd}`
-        6. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
-        7. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
+        2. Review each changed file for correctness against the project requirements and plans above
+        3. Look for: logic errors, missed edge cases, off-by-one bugs, incorrect API usage, poor error messages, naming issues
+        4. As a secondary check, run tests (`{cfg.test_cmd}`) and lint (`{cfg.lint_cmd}`)
+        5. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
+        6. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
 
         IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
     """)
@@ -1528,12 +1571,12 @@ p.write_text(text)
     console.print(f"  When done, run: [bold]wb approve {proj.slug}[/bold]")
 
 
-@app.command()
+@app.command(rich_help_panel="Review & Ship")
 def approve(
     project: str = typer.Argument(autocompletion=complete_project),
     stage: int = typer.Option(None, "--stage", "-s", help="Stage ID to approve (auto-detects first 'reviewed' stage if omitted)"),
 ):
-    """Create PR and launch CI monitor after review."""
+    """Push branch, create PR, and launch CI monitor."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
@@ -1589,15 +1632,30 @@ def approve(
         console.print("[red]Sandbox not found[/red]")
         raise typer.Exit(1)
 
-    # Build PR summary from the Notes section of the Obsidian project note
-    summary = ""
-    if proj.path and proj.path.exists():
-        note_text = proj.path.read_text()
-        notes_match = re.search(r"^## Notes\s*\n(.*)", note_text, re.DOTALL | re.MULTILINE)
-        if notes_match:
-            summary = notes_match.group(1).strip()
-    if not summary:
-        summary = f"Implementation of: {proj.title}"
+    # Generate PR summary from diff stat and commit log
+    diff_stat = subprocess.run(
+        ["git", "diff", "--stat", "origin/main"],
+        cwd=sandbox_path, capture_output=True, text=True,
+    ).stdout.strip()
+    commit_log = subprocess.run(
+        ["git", "log", "--oneline", "origin/main..HEAD"],
+        cwd=sandbox_path, capture_output=True, text=True,
+    ).stdout.strip()
+
+    summary = f"Implementation of: {proj.title}"
+    if diff_stat or commit_log:
+        ai_prompt = (
+            f"Given this diff stat and commit log for a PR titled '{proj.title}', "
+            f"write a brief PR description as 3-5 bullet points. "
+            f"Be concise and technical. Do not reference project management tools or notes.\n\n"
+            f"Diff stat:\n{diff_stat}\n\nCommit log:\n{commit_log}"
+        )
+        ai_result = subprocess.run(
+            ["claude", "-p", ai_prompt],
+            capture_output=True, text=True, timeout=60,
+        )
+        if ai_result.returncode == 0 and ai_result.stdout.strip():
+            summary = ai_result.stdout.strip()
 
     # Safety check: warn if any wb working files ended up tracked in git
     wb_files = list(sandbox_path.glob(".wb-*.md")) + list(sandbox_path.glob(".wb-*.sh"))
@@ -1840,7 +1898,7 @@ p.write_text(text)
     console.print(f"\n[bold]Done![/bold] PR: {pr_url}")
 
 
-@app.command("open")
+@app.command("open", rich_help_panel="Project Management")
 def open_cmd(project: str = typer.Argument(autocompletion=complete_project)):
     """Open a project's Obsidian note."""
     cfg = load_config()
@@ -1850,7 +1908,7 @@ def open_cmd(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[green]Opened {proj.slug} in Obsidian[/green]")
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def chat(project: str = typer.Argument(autocompletion=complete_project)):
     """Launch an informal Claude chat with project context."""
     cfg = load_config()
@@ -1873,6 +1931,7 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Chatting about: {proj.title}[/bold]")
     console.print("[dim]Informal Claude session with project context.[/dim]\n")
 
+    set_tab_title(f"wb: {project} (chat)")
     _set_project_env(proj)
     subprocess.run(
         [
@@ -1883,13 +1942,18 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
             initial_msg,
         ],
     )
+    set_tab_title("")
 
     append_session_note(proj, "chat", f"Chat session about {proj.title}")
 
 
-@app.command()
-def review(project: str = typer.Argument(autocompletion=complete_project)):
-    """Run interactive Codex code review on a project sandbox."""
+@app.command(rich_help_panel="Review & Ship")
+def review(
+    project: str = typer.Argument(autocompletion=complete_project),
+    human: bool = typer.Option(False, "--human", help="Open Cursor diff view for manual review"),
+    base: str = typer.Option("origin/main", "--base", help="Base ref for diff (used with --human)"),
+):
+    """Run code review on a project sandbox (AI by default, --human for Cursor)."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
@@ -1898,10 +1962,19 @@ def review(project: str = typer.Argument(autocompletion=complete_project)):
         raise typer.Exit(1)
 
     sandbox_path = Path(proj.sandbox)
+
+    if human:
+        console.print(f"[bold]Opening Cursor diff view for {proj.slug}[/bold]")
+        subprocess.run(["git", "fetch", "origin", "main"], cwd=sandbox_path, capture_output=True)
+        subprocess.run(["cursor", "--diff", base, "HEAD"], cwd=sandbox_path)
+        return
+
+    set_tab_title(f"wb: {project} (review)")
     _codex_review(cfg, proj, sandbox_path)
+    set_tab_title("")
 
 
-@app.command()
+@app.command(rich_help_panel="Development")
 def cursor(project: str = typer.Argument(autocompletion=complete_project)):
     """Open project sandbox in Cursor with changed files."""
     cfg = load_config()
@@ -1913,11 +1986,18 @@ def cursor(project: str = typer.Argument(autocompletion=complete_project)):
 
     sandbox_path = Path(proj.sandbox)
 
+    # Fetch latest main so diff is accurate
+    subprocess.run(
+        ["git", "fetch", "origin", "main"],
+        cwd=sandbox_path,
+        capture_output=True,
+    )
+
     # Get files changed in this branch since diverging from main (committed + uncommitted)
     changed = set()
     # Committed changes on this branch
     result = subprocess.run(
-        ["git", "diff", "--name-only", "main...HEAD"],
+        ["git", "diff", "--name-only", "origin/main...HEAD"],
         cwd=sandbox_path,
         capture_output=True,
         text=True,
@@ -1959,9 +2039,9 @@ PHOENIX_CLOUD_VARS = [
 ]
 
 
-@app.command()
+@app.command(rich_help_panel="Development")
 def dev(project: str = typer.Argument(autocompletion=complete_project)):
-    """Launch local Phoenix dev environment for a project sandbox."""
+    """Launch local Phoenix dev server in tmux for a project sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
@@ -1970,6 +2050,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
         raise typer.Exit(1)
 
     sandbox_path = Path(proj.sandbox)
+    set_tab_title(f"wb: {project} (dev)")
 
     # Source model API keys from main phoenix .env
     env_file = cfg.sandbox_root.parent / "phoenix" / ".env"
@@ -2103,7 +2184,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     console.print("  [dim]DB:[/dim]      ~/.phoenix")
 
 
-@app.command()
+@app.command(rich_help_panel="Project Management")
 def new(title: str = typer.Argument(..., help="Project title")):
     """Create a new project note without a GitHub issue."""
     cfg = load_config()
@@ -2123,7 +2204,7 @@ def new(title: str = typer.Argument(..., help="Project title")):
     console.print(f"  Next: [bold]wb plan {slug}[/bold]")
 
 
-@app.command()
+@app.command(rich_help_panel="Project Management")
 def done(
     project: str = typer.Argument(autocompletion=complete_project),
     stage_id: int = typer.Argument(None),
@@ -2178,7 +2259,7 @@ def done(
         console.print(f"[green]{proj.slug} marked {new_status}.[/green]")
 
 
-@app.command()
+@app.command(rich_help_panel="Project Management")
 def archive(project: str = typer.Argument(autocompletion=complete_project)):
     """Archive a project and clean up its background sessions."""
     cfg = load_config()
@@ -2208,7 +2289,7 @@ def archive(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[green]{proj.slug} archived.[/green]")
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def organize(
     dry_run: bool = typer.Option(
         False, "--dry-run", "-n", help="Preview changes without modifying files"
@@ -2229,7 +2310,7 @@ def organize(
     raise typer.Exit(result.returncode)
 
 
-@app.command()
+@app.command(rich_help_panel="Utilities")
 def tui():
     """Launch the TUI workspace control panel in tmux."""
     session = "wb-workspace"
