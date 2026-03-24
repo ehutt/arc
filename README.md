@@ -42,6 +42,8 @@ echo 'alias arc="uv run --script ~/path/to/arc/arc.py"' >> ~/.zshrc
 ln -s ~/path/to/arc/arc.py ~/.local/bin/arc
 ```
 
+Project slug autocompletion is built in via Typer — tab-complete works for all commands that take a `<slug>` argument.
+
 ### First run
 
 ```bash
