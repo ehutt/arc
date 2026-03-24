@@ -1,4 +1,4 @@
-# CLAUDE.md — wb repo
+# CLAUDE.md — arc repo
 
 ## Workflow
 - After every feature, fix, or change, create a git commit and push to main.

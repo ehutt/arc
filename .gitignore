@@ -1,0 +1,12 @@
+# User-specific config (contains personal paths and GitHub username)
+config.toml
+
+# Runtime state
+.organize-state.json
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc

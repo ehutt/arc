@@ -7,12 +7,13 @@
 #     "pyyaml>=6",
 # ]
 # ///
-"""wb — lightweight agent project scaffolding."""
+"""arc — lightweight agent project scaffolding."""
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,10 +32,25 @@ from typer._completion_classes import completion_init
 
 completion_init()
 
+def _find_claude() -> str:
+    """Locate the claude binary, checking nvm paths if not on PATH."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    # nvm installs aren't always on PATH in non-interactive shells
+    nvm_dir = os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
+    for node_bin in sorted(Path(nvm_dir, "versions", "node").glob("*/bin/claude"), reverse=True):
+        if node_bin.is_file():
+            return str(node_bin)
+    return "claude"
+
+
+CLAUDE_BIN = _find_claude()
+
 
 def _set_project_env(proj: Project) -> None:
-    """Set WB_PROJECT_SLUG so Claude hooks can identify the project."""
-    os.environ["WB_PROJECT_SLUG"] = proj.slug
+    """Set ARC_PROJECT_SLUG so Claude hooks can identify the project."""
+    os.environ["ARC_PROJECT_SLUG"] = proj.slug
 
 
 def _clean_env() -> dict[str, str]:
@@ -304,6 +320,12 @@ def derive_project_status(stages: list[Stage], manual_status: str = "") -> str:
 
 def parse_project(path: Path) -> Project | None:
     text = path.read_text()
+    def _safe_int(val: object, default: int = 0) -> int:
+        try:
+            return int(val)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            return default
+
     m = re.match(r"^---\n(.+?)\n---", text, re.DOTALL)
     if not m:
         return None
@@ -340,7 +362,7 @@ def parse_project(path: Path) -> Project | None:
         related_notes=fm.get("related_notes", []),
         plans=fm.get("plans", []),
         stages=stages,
-        dev_port=int(fm.get("dev_port", 0)),
+        dev_port=_safe_int(fm.get("dev_port", 0)),
         dev_session=fm.get("dev_session", ""),
         path=path,
     )
@@ -369,6 +391,16 @@ def find_project(cfg: Config, slug: str) -> Project:
     raise typer.Exit(1)
 
 
+def _quick_status(index_path: Path) -> str:
+    """Extract status from frontmatter without full YAML parse."""
+    try:
+        text = index_path.read_text(encoding="utf-8")[:500]
+        m = re.search(r"^status:\s*(\S+)", text, re.MULTILINE)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
 def complete_project(incomplete: str) -> list[str]:
     try:
         cfg = load_config()
@@ -379,6 +411,7 @@ def complete_project(incomplete: str) -> list[str]:
             and not d.name.startswith(".")
             and (d / "index.md").exists()
             and d.name.startswith(incomplete)
+            and _quick_status(d / "index.md") not in ("done", "archived")
         ]
         return sorted(slugs)
     except Exception:
@@ -420,13 +453,13 @@ def create_project_note(
     note_body = textwrap.dedent(f"""\
 
     ## Objective
-    {body or "(to be filled during wb plan)"}
+    {body or "(to be filled during arc plan)"}
 
     ## Tasks
-    (filled during wb plan)
+    (filled during arc plan)
 
     ## Spec
-    (filled during wb plan)
+    (filled during arc plan)
 
     ## Notes
     ### {today}
@@ -590,7 +623,7 @@ def set_tab_title(title: str) -> None:
 
 @app.callback()
 def dashboard(ctx: typer.Context):
-    """wb — project dashboard and scaffolding."""
+    """arc — project dashboard and scaffolding."""
     if ctx.invoked_subcommand is not None:
         return
     cfg = load_config()
@@ -598,7 +631,7 @@ def dashboard(ctx: typer.Context):
     projects = load_projects(cfg)
     projects = [p for p in projects if p.derived_status != "archived"]
     if not projects:
-        console.print("[dim]No projects found. Run [bold]wb sync[/bold] to pull issues.[/dim]")
+        console.print("[dim]No projects found. Run [bold]arc sync[/bold] to pull issues.[/dim]")
         return
 
     active_sessions = tmux_sessions()
@@ -634,11 +667,11 @@ def dashboard(ctx: typer.Context):
             if pr_match:
                 pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
 
-        # Branch — clickable, opens sandbox in Cursor
+        # Branch — clickable, opens sandbox in VS Code
         branch_display = "[dim]—[/dim]"
         if p.branch:
             if p.sandbox and Path(p.sandbox).exists():
-                branch_display = f"[link=cursor://file/{p.sandbox}]{p.branch}[/link]"
+                branch_display = f"[link=vscode://file/{p.sandbox}]{p.branch}[/link]"
             else:
                 branch_display = p.branch
 
@@ -646,12 +679,12 @@ def dashboard(ctx: typer.Context):
         session_parts = []
         tmux_matches = [
             s for s in active_sessions
-            if s.startswith(f"wb-{p.slug}") and s != f"wb-{p.slug}-dev"
+            if s.startswith(f"arc-{p.slug}") and s != f"arc-{p.slug}-dev"
         ]
         for s in tmux_matches:
             has_tmux_sessions = True
-            # Extract session type from name: wb-slug -> "impl", wb-slug-ci -> "ci"
-            suffix = s[len(f"wb-{p.slug}"):]
+            # Extract session type from name: arc-slug -> "impl", arc-slug-ci -> "ci"
+            suffix = s[len(f"arc-{p.slug}"):]
             label = suffix.lstrip("-") if suffix else "impl"
             if tmux_session_alive(s):
                 session_parts.append(f"[green]{label}[/green]")
@@ -668,12 +701,7 @@ def dashboard(ctx: typer.Context):
         status = p.derived_status
         color = STATUS_COLORS.get(status, "white")
 
-        # Show current stage name when implementing
         status_display = status
-        if status == "implementing" and p.stages:
-            running = next((s for s in p.stages if s.status == "running"), None)
-            if running:
-                status_display = f"implementing ({running.name})"
 
         table.add_row(
             f"[link={url}]{p.slug}[/link]",
@@ -687,7 +715,7 @@ def dashboard(ctx: typer.Context):
 
     console.print(table)
     if has_tmux_sessions:
-        console.print("[dim]  attach sessions: tmux attach -t wb-<slug>[-ci][/dim]")
+        console.print("[dim]  attach sessions: tmux attach -t arc-<slug>[-ci][/dim]")
 
 
 @app.command(rich_help_panel="Project Management")
@@ -910,11 +938,12 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Launching planning session for: {proj.title}[/bold]")
     console.print("[dim]Chat with Claude to refine the plan. Exit when done.[/dim]\n")
 
-    set_tab_title(f"wb: {project} (plan)")
+    set_tab_title(f"arc: {project} (plan)")
     _set_project_env(proj)
+    plan_dir = Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
     subprocess.run(
         [
-            "claude",
+            CLAUDE_BIN,
             "--dangerously-skip-permissions",
             "--permission-mode",
             "plan",
@@ -922,6 +951,7 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
             system_prompt,
             initial_msg,
         ],
+        cwd=plan_dir,
     )
     set_tab_title("")
 
@@ -969,7 +999,7 @@ def stage_cmd(
             raise typer.Exit(1)
         if not proj.is_folder:
             console.print(
-                "[red]Stage planning requires folder-per-project format. Run: wb migrate[/red]"
+                "[red]Stage planning requires folder-per-project format. Run: arc migrate[/red]"
             )
             raise typer.Exit(1)
 
@@ -998,9 +1028,9 @@ def stage_cmd(
         console.print(f"[bold]Planning stage {s.id}: {s.name}[/bold]")
         _set_project_env(proj)
         os.execvp(
-            "claude",
+            CLAUDE_BIN,
             [
-                "claude",
+                CLAUDE_BIN,
                 "--dangerously-skip-permissions",
                 "--permission-mode",
                 "plan",
@@ -1014,7 +1044,7 @@ def stage_cmd(
     # Default: list stages
     if not proj.stages:
         console.print(f"[dim]No stages defined for {proj.slug}.[/dim]")
-        console.print(f'Add with: [bold]wb stage {proj.slug} --add "Stage name"[/bold]')
+        console.print(f'Add with: [bold]arc stage {proj.slug} --add "Stage name"[/bold]')
         return
 
     done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
@@ -1129,10 +1159,13 @@ def implement(
     proj = find_project(cfg, project)
 
     if not proj.sandbox or not Path(proj.sandbox).exists():
-        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
+        console.print(f"[red]No sandbox found. Run: arc sandbox {proj.slug}[/red]")
         raise typer.Exit(1)
 
     sandbox_path = Path(proj.sandbox)
+
+    # Source model API keys from main phoenix .env
+    _load_env_keys(cfg)
 
     # --- Background mode: autonomous implement → review pipeline in tmux ---
     if bg:
@@ -1276,11 +1309,11 @@ def _implement_interactive_staged(
     console.print(f"[bold]Implementing stage {stage.id}: {stage.name}[/bold]")
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
 
-    set_tab_title(f"wb: {proj.slug} (impl)")
+    set_tab_title(f"arc: {proj.slug} (impl)")
     _set_project_env(proj)
     initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
     subprocess.run(
-        ["claude", "--dangerously-skip-permissions", "--system-prompt", system_prompt, initial_msg],
+        [CLAUDE_BIN, "--dangerously-skip-permissions", "--system-prompt", system_prompt, initial_msg],
         cwd=sandbox_path,
         env=_clean_env(),
     )
@@ -1313,7 +1346,7 @@ def _implement_interactive_staged(
             names = [f"{s.id} ({s.name})" for s in newly_unblocked]
             console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
             notify(
-                "wb", f"{stage.name} done. Unblocked: {', '.join(s.name for s in newly_unblocked)}"
+                "arc", f"{stage.name} done. Unblocked: {', '.join(s.name for s in newly_unblocked)}"
             )
         else:
             console.print("[dim]No new stages unblocked.[/dim]")
@@ -1322,9 +1355,9 @@ def _implement_interactive_staged(
             proj.status = "reviewed"
             update_project_note(proj)
             console.print(
-                f"[green bold]All stages complete! Review changes, then: wb approve {proj.slug}[/green bold]"
+                f"[green bold]All stages complete! Review changes, then: arc approve {proj.slug}[/green bold]"
             )
-            notify("wb", f"AI review complete for {proj.slug} — ready for your review")
+            notify("arc", f"AI review complete for {proj.slug} — ready for your review")
 
     elif choice == "skip":
         stage.status = "skipped"
@@ -1332,7 +1365,7 @@ def _implement_interactive_staged(
         console.print(f"[yellow]Stage {stage.id} skipped.[/yellow]")
     else:
         console.print(
-            f"[dim]Stage {stage.id} still running. Resume with: wb implement {proj.slug} {stage.id}[/dim]"
+            f"[dim]Stage {stage.id} still running. Resume with: arc implement {proj.slug} {stage.id}[/dim]"
         )
 
 
@@ -1360,11 +1393,11 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
     console.print(f"[bold]Implementing: {proj.title}[/bold]")
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
 
-    set_tab_title(f"wb: {proj.slug} (impl)")
+    set_tab_title(f"arc: {proj.slug} (impl)")
     _set_project_env(proj)
     subprocess.run(
         [
-            "claude",
+            CLAUDE_BIN,
             "--dangerously-skip-permissions",
             "--system-prompt",
             system_prompt,
@@ -1383,11 +1416,11 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
     console.print()
     choice = input("Ready to approve? [Y/n] ").strip().lower()
     if choice in ("", "y", "yes"):
-        console.print(f"[green]Ready for approval. Run: wb approve {proj.slug}[/green]")
+        console.print(f"[green]Ready for approval. Run: arc approve {proj.slug}[/green]")
     else:
         proj.status = "implementing"
         update_project_note(proj)
-        console.print(f"[dim]Project still implementing. Re-run: wb implement {proj.slug}[/dim]")
+        console.print(f"[dim]Project still implementing. Re-run: arc implement {proj.slug}[/dim]")
 
 
 def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
@@ -1448,18 +1481,28 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
 
     project_note_path = str(proj.path) if proj.path else ""
 
+    # Build export lines for model API keys
+    env_exports = ""
+    for key in MODEL_API_KEYS:
+        val = os.environ.get(key, "")
+        if val:
+            escaped = val.replace("'", "'\\''")
+            env_exports += f"export {key}='{escaped}'\n"
+
     orchestrator = textwrap.dedent(f"""\
         #!/bin/bash
         set -e
         cd "{sandbox_path}"
-        export WB_PROJECT_SLUG="{proj.slug}"
+        export ARC_PROJECT_SLUG="{proj.slug}"
 
+        # Model API keys from phoenix .env
+        {env_exports}
         # Strip conda/virtualenv env vars to avoid package resolution issues
         unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_SHLVL CONDA_EXE
         unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
         export PATH=$(echo "$PATH" | tr ':' '\\n' | grep -v -e miniconda -e anaconda -e '\\.venv' | tr '\\n' ':' | sed 's/:$//')
 
-        echo "=== wb: Starting implementation (Claude) for {proj.slug} ==="
+        echo "=== arc: Starting implementation (Claude) for {proj.slug} ==="
 
         python3 -c "
 import re, yaml
@@ -1470,7 +1513,7 @@ text = re.sub(r'status: \\w[\\w-]*', 'status: implementing', text, count=1)
 p.write_text(text)
 "
 
-        claude --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Track your changes with git: after every meaningful change, stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Before finishing, commit any remaining modified files. When done, append a dated Notes entry to the Obsidian project note (path is in CLAUDE.md). NEVER write summary/notes/review files into the codebase."
+        {CLAUDE_BIN} --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Track your changes with git: after every meaningful change, stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Before finishing, commit any remaining modified files. When done, append a dated Notes entry to the Obsidian project note (path is in CLAUDE.md). NEVER write summary/notes/review files into the codebase."
 
         python3 -c "
 import re
@@ -1494,7 +1537,7 @@ if notes_match:
     p.write_text(text)
 "
 
-        echo "=== wb: Implementation done, starting Codex review ({CODEX_MODEL}) ==="
+        echo "=== arc: Implementation done, starting Codex review ({CODEX_MODEL}) ==="
 
         python3 -c "
 import re
@@ -1529,7 +1572,7 @@ if notes_match:
     p.write_text(text)
 "
 
-        echo "=== wb: Codex review complete ==="
+        echo "=== arc: Codex review complete ==="
 
         python3 -c "
 import re
@@ -1540,16 +1583,16 @@ text = re.sub(r'status: \\w[\\w-]*', 'status: reviewed', text, count=1)
 p.write_text(text)
 "
 
-        osascript -e 'display notification "AI review complete for {proj.slug}. Ready for your review." with title "wb: {proj.slug}"'
+        osascript -e 'display notification "AI review complete for {proj.slug}. Ready for your review." with title "arc: {proj.slug}"'
         echo -e "\\a"
-        echo "=== wb: {proj.slug} AI review complete. Review changes, then: wb approve {proj.slug} ==="
+        echo "=== arc: {proj.slug} AI review complete. Review changes, then: arc approve {proj.slug} ==="
     """)
 
-    script_path = sandbox_path / ".wb-orchestrate.sh"
+    script_path = sandbox_path / ".arc-orchestrate.sh"
     script_path.write_text(orchestrator)
     script_path.chmod(0o755)
 
-    sess_name = f"wb-{proj.slug}"
+    sess_name = f"arc-{proj.slug}"
     if tmux_session_exists(sess_name):
         console.print(f"[yellow]tmux session '{sess_name}' already exists.[/yellow]")
         console.print(f"Attach with: [bold]tmux attach -t {sess_name}[/bold]")
@@ -1565,7 +1608,7 @@ p.write_text(text)
 
     console.print(f"[green]Pipeline launched in tmux session: {sess_name}[/green]")
     console.print(f"  Attach: [bold]tmux attach -t {sess_name}[/bold]")
-    console.print(f"  When done, run: [bold]wb approve {proj.slug}[/bold]")
+    console.print(f"  When done, run: [bold]arc approve {proj.slug}[/bold]")
 
 
 @app.command(rich_help_panel="Review & Ship")
@@ -1648,33 +1691,33 @@ def approve(
             f"Diff stat:\n{diff_stat}\n\nCommit log:\n{commit_log}"
         )
         ai_result = subprocess.run(
-            ["claude", "-p", ai_prompt],
+            [CLAUDE_BIN, "-p", ai_prompt],
             capture_output=True, text=True, timeout=60,
         )
         if ai_result.returncode == 0 and ai_result.stdout.strip():
             summary = ai_result.stdout.strip()
 
-    # Safety check: warn if any wb working files ended up tracked in git
-    wb_files = list(sandbox_path.glob(".wb-*.md")) + list(sandbox_path.glob(".wb-*.sh"))
-    tracked_wb_files = []
-    for f in wb_files:
+    # Safety check: warn if any arc working files ended up tracked in git
+    arc_files = list(sandbox_path.glob(".arc-*.md")) + list(sandbox_path.glob(".arc-*.sh"))
+    tracked_arc_files = []
+    for f in arc_files:
         result = subprocess.run(
             ["git", "ls-files", "--error-unmatch", str(f)],
             cwd=sandbox_path,
             capture_output=True,
         )
         if result.returncode == 0:
-            tracked_wb_files.append(str(f))
-    if tracked_wb_files:
+            tracked_arc_files.append(str(f))
+    if tracked_arc_files:
         console.print(
-            f"[red bold]ERROR: {len(tracked_wb_files)} wb working file(s) are tracked in git:[/red bold]"
+            f"[red bold]ERROR: {len(tracked_arc_files)} arc working file(s) are tracked in git:[/red bold]"
         )
-        for f in tracked_wb_files:
+        for f in tracked_arc_files:
             console.print(f"  [red]{f}[/red]")
         console.print("[red]These must not be in the codebase. Removing from git and committing...[/red]")
-        subprocess.run(["git", "rm", "--cached", *tracked_wb_files], cwd=sandbox_path, check=True)
+        subprocess.run(["git", "rm", "--cached", *tracked_arc_files], cwd=sandbox_path, check=True)
         subprocess.run(
-            ["git", "commit", "-m", "chore: remove accidentally tracked wb working files"],
+            ["git", "commit", "-m", "chore: remove accidentally tracked arc working files"],
             cwd=sandbox_path,
             check=True,
         )
@@ -1759,13 +1802,13 @@ def approve(
     proj.github_prs.append(pr_url)
     update_project_note(proj)
 
-    sess_name = f"wb-{proj.slug}-ci"
+    sess_name = f"arc-{proj.slug}-ci"
     project_note_path = str(proj.path) if proj.path else ""
 
     # Build the merge handler based on whether this is a stage-level approval
     if approving_stage:
         merge_handler = f'''
-                echo "=== wb: PR merged! ==="
+                echo "=== arc: PR merged! ==="
                 python3 -c "
 import yaml, re
 from pathlib import Path
@@ -1793,12 +1836,12 @@ if m:
     new_fm = yaml.dump(fm, default_flow_style=False, sort_keys=False)
     p.write_text('---\\n' + new_fm + '---\\n' + body)
 "
-                osascript -e 'display notification "Stage {approving_stage.id} merged!" with title "wb: {proj.slug}"'
+                osascript -e 'display notification "Stage {approving_stage.id} merged!" with title "arc: {proj.slug}"'
                 break'''
     else:
         merge_handler = f'''
-                echo "=== wb: PR merged! ==="
-                tmux kill-session -t "wb-{proj.slug}-dev" 2>/dev/null || true
+                echo "=== arc: PR merged! ==="
+                tmux kill-session -t "arc-{proj.slug}-dev" 2>/dev/null || true
                 python3 -c "
 import re
 from pathlib import Path
@@ -1809,14 +1852,14 @@ text = re.sub(r'\\ndev_port:.*', '', text)
 text = re.sub(r'\\ndev_session:.*', '', text)
 p.write_text(text)
 "
-                osascript -e 'display notification "PR merged!" with title "wb: {proj.slug}"'
+                osascript -e 'display notification "PR merged!" with title "arc: {proj.slug}"'
                 break'''
 
     ci_script = textwrap.dedent(f"""\
         #!/bin/bash
         cd "{sandbox_path}"
 
-        echo "=== wb: Monitoring CI for {proj.slug} ==="
+        echo "=== arc: Monitoring CI for {proj.slug} ==="
 
         set_status() {{
             python3 -c "
@@ -1858,22 +1901,22 @@ p.write_text(text)
 
             # Only update + notify on status change
             if [ "$new_status" != "$prev_status" ]; then
-                echo "=== wb: status -> $new_status ==="
+                echo "=== arc: status -> $new_status ==="
                 set_status "$new_status"
 
                 case "$new_status" in
                     ci-failing)
-                        osascript -e 'display notification "CI failing — launching fix agent" with title "wb: {proj.slug}"'
-                        claude --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Push."
+                        osascript -e 'display notification "CI failing — launching fix agent" with title "arc: {proj.slug}"'
+                        {CLAUDE_BIN} --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Push."
                         # After fix attempt, reset so next loop re-evaluates
                         prev_status=""
                         continue
                         ;;
                     ci-passing)
-                        osascript -e 'display notification "CI passing" with title "wb: {proj.slug}"'
+                        osascript -e 'display notification "CI passing" with title "arc: {proj.slug}"'
                         ;;
                     pr-approved)
-                        osascript -e 'display notification "PR approved!" with title "wb: {proj.slug}"'
+                        osascript -e 'display notification "PR approved!" with title "arc: {proj.slug}"'
                         ;;
                 esac
                 prev_status="$new_status"
@@ -1881,7 +1924,7 @@ p.write_text(text)
         done
     """)
 
-    ci_script_path = sandbox_path / ".wb-ci-monitor.sh"
+    ci_script_path = sandbox_path / ".arc-ci-monitor.sh"
     ci_script_path.write_text(ci_script)
     ci_script_path.chmod(0o755)
 
@@ -1895,8 +1938,8 @@ p.write_text(text)
     console.print(f"\n[bold]Done![/bold] PR: {pr_url}")
 
 
-@app.command("open", rich_help_panel="Project Management")
-def open_cmd(project: str = typer.Argument(autocompletion=complete_project)):
+@app.command("note", rich_help_panel="Project Management")
+def note_cmd(project: str = typer.Argument(autocompletion=complete_project)):
     """Open a project's Obsidian note."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -1928,16 +1971,18 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"[bold]Chatting about: {proj.title}[/bold]")
     console.print("[dim]Informal Claude session with project context.[/dim]\n")
 
-    set_tab_title(f"wb: {project} (chat)")
+    set_tab_title(f"arc: {project} (chat)")
     _set_project_env(proj)
+    chat_dir = Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
     subprocess.run(
         [
-            "claude",
+            CLAUDE_BIN,
             "--dangerously-skip-permissions",
             "--system-prompt",
             system_prompt,
             initial_msg,
         ],
+        cwd=chat_dir,
     )
     set_tab_title("")
 
@@ -1947,41 +1992,38 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
 @app.command(rich_help_panel="Review & Ship")
 def review(
     project: str = typer.Argument(autocompletion=complete_project),
-    human: bool = typer.Option(False, "--human", help="Open Cursor diff view for manual review"),
-    base: str = typer.Option("origin/main", "--base", help="Base ref for diff (used with --human)"),
 ):
-    """Run code review on a project sandbox (AI by default, --human for Cursor)."""
+    """Run AI code review on a project sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
     if not proj.sandbox or not Path(proj.sandbox).exists():
-        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
+        console.print(f"[red]No sandbox found. Run: arc sandbox {proj.slug}[/red]")
         raise typer.Exit(1)
 
     sandbox_path = Path(proj.sandbox)
 
-    if human:
-        console.print(f"[bold]Opening Cursor diff view for {proj.slug}[/bold]")
-        subprocess.run(["git", "fetch", "origin", "main"], cwd=sandbox_path, capture_output=True)
-        subprocess.run(["cursor", "--diff", base, "HEAD"], cwd=sandbox_path)
-        return
-
-    set_tab_title(f"wb: {project} (review)")
+    set_tab_title(f"arc: {project} (review)")
     _codex_review(cfg, proj, sandbox_path)
     set_tab_title("")
 
 
 @app.command(rich_help_panel="Development")
-def cursor(project: str = typer.Argument(autocompletion=complete_project)):
-    """Open project sandbox in Cursor with changed files."""
+def editor(
+    project: str = typer.Argument(autocompletion=complete_project),
+    use_cursor: bool = typer.Option(False, "--cursor", help="Open in Cursor instead of VS Code"),
+):
+    """Open project sandbox in VS Code (or Cursor with --cursor) with changed files."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
     if not proj.sandbox or not Path(proj.sandbox).exists():
-        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
+        console.print(f"[red]No sandbox found. Run: arc sandbox {proj.slug}[/red]")
         raise typer.Exit(1)
 
     sandbox_path = Path(proj.sandbox)
+    editor_bin = "cursor" if use_cursor else "code"
+    editor_name = "Cursor" if use_cursor else "VS Code"
 
     # Fetch latest main so diff is accurate
     subprocess.run(
@@ -2010,10 +2052,10 @@ def cursor(project: str = typer.Argument(autocompletion=complete_project)):
     )
     if result.returncode == 0 and result.stdout.strip():
         changed.update(result.stdout.strip().splitlines())
-    changed_files = sorted(changed)
+    changed_files = [str(sandbox_path / f) for f in sorted(changed)]
 
-    cmd = ["cursor", str(sandbox_path)] + changed_files
-    console.print(f"[green]Opening {proj.slug} in Cursor[/green]")
+    cmd = [editor_bin, str(sandbox_path)] + changed_files
+    console.print(f"[green]Opening {proj.slug} in {editor_name}[/green]")
     if changed_files:
         console.print(f"[dim]{len(changed_files)} changed file(s)[/dim]")
     subprocess.run(cmd)
@@ -2036,6 +2078,23 @@ PHOENIX_CLOUD_VARS = [
 ]
 
 
+def _load_env_keys(cfg: Config) -> None:
+    """Load MODEL_API_KEYS from the main phoenix .env into os.environ."""
+    env_file = cfg.sandbox_root.parent / "phoenix" / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:]
+        key, _, value = line.partition("=")
+        value = value.strip().strip("'\"")
+        if key in MODEL_API_KEYS:
+            os.environ[key] = value
+
+
 @app.command(rich_help_panel="Development")
 def dev(project: str = typer.Argument(autocompletion=complete_project)):
     """Launch local Phoenix dev server in tmux for a project sandbox."""
@@ -2043,25 +2102,14 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     proj = find_project(cfg, project)
 
     if not proj.sandbox or not Path(proj.sandbox).exists():
-        console.print(f"[red]No sandbox found. Run: wb sandbox {proj.slug}[/red]")
+        console.print(f"[red]No sandbox found. Run: arc sandbox {proj.slug}[/red]")
         raise typer.Exit(1)
 
     sandbox_path = Path(proj.sandbox)
-    set_tab_title(f"wb: {project} (dev)")
+    set_tab_title(f"arc: {project} (dev)")
 
     # Source model API keys from main phoenix .env
-    env_file = cfg.sandbox_root.parent / "phoenix" / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # Strip optional "export " prefix
-            if line.startswith("export "):
-                line = line[7:]
-            key, _, value = line.partition("=")
-            if key in MODEL_API_KEYS:
-                os.environ[key] = value
+    _load_env_keys(cfg)
 
     # Unset cloud-targeting vars
     for var in PHOENIX_CLOUD_VARS:
@@ -2110,7 +2158,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     if active_servers:
         console.print("[dim]Running Phoenix servers:[/dim]")
         for sess, port in active_servers.items():
-            marker = " ← this project" if sess == f"wb-{proj.slug}-dev" else ""
+            marker = " ← this project" if sess == f"arc-{proj.slug}-dev" else ""
             console.print(f"  [cyan]{sess}[/cyan]  http://localhost:{port}{marker}")
 
     # Step 4: Determine launch action
@@ -2118,7 +2166,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
         port = 6006
     else:
         next_port = next_free_port(6007)
-        default_choice = "1" if f"wb-{proj.slug}-dev" in active_servers else "3"
+        default_choice = "1" if f"arc-{proj.slug}-dev" in active_servers else "3"
         console.print("\n[bold]Phoenix launch options:[/bold]")
         console.print("  [1] Skip — don't launch Phoenix")
         console.print("  [2] Replace — kill all servers, launch on :6006")
@@ -2151,12 +2199,13 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
             port = next_port
 
     # Step 5: Launch in tmux background
-    dev_script = Path(f"/tmp/wb-dev-{proj.slug}.sh")
+    dev_script = Path(f"/tmp/arc-dev-{proj.slug}.sh")
     lines = ["#!/usr/bin/env bash"]
     for key in MODEL_API_KEYS:
         val = os.environ.get(key, "")
         if val:
-            lines.append(f'export {key}="{val}"')
+            escaped = val.replace("'", "'\\''")
+            lines.append(f"export {key}='{escaped}'")
     for var in PHOENIX_CLOUD_VARS:
         lines.append(f"unset {var}")
     lines.append(f'export PHOENIX_WORKING_DIR="{Path.home() / ".phoenix"}"')
@@ -2165,7 +2214,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     dev_script.write_text("\n".join(lines) + "\n")
     dev_script.chmod(0o755)
 
-    session_name = f"wb-{proj.slug}-dev"
+    session_name = f"arc-{proj.slug}-dev"
     if tmux_session_exists(session_name):
         subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
     subprocess.run(["tmux", "new-session", "-d", "-s", session_name, str(dev_script)], check=True)
@@ -2198,7 +2247,25 @@ def new(title: str = typer.Argument(..., help="Project title")):
 
     proj = create_project_note(cfg, title, slug)
     console.print(f"[green]Created:[/green] {proj.path}")
-    console.print(f"  Next: [bold]wb plan {slug}[/bold]")
+    console.print(f"  Next: [bold]arc plan {slug}[/bold]")
+
+
+def _kill_sessions(proj: "Project") -> None:
+    """Kill all tmux sessions associated with a project."""
+    # Dev server
+    if proj.dev_session and tmux_session_exists(proj.dev_session):
+        subprocess.run(["tmux", "kill-session", "-t", proj.dev_session], capture_output=True)
+        console.print(f"[dim]Killed dev session: {proj.dev_session}[/dim]")
+    # CI monitor
+    ci_sess = f"arc-{proj.slug}-ci"
+    if tmux_session_exists(ci_sess):
+        subprocess.run(["tmux", "kill-session", "-t", ci_sess], capture_output=True)
+        console.print(f"[dim]Killed CI session: {ci_sess}[/dim]")
+    # Implement session
+    impl_sess = f"arc-{proj.slug}"
+    if tmux_session_exists(impl_sess):
+        subprocess.run(["tmux", "kill-session", "-t", impl_sess], capture_output=True)
+        console.print(f"[dim]Killed implement session: {impl_sess}[/dim]")
 
 
 @app.command(rich_help_panel="Project Management")
@@ -2207,13 +2274,12 @@ def done(
     stage_id: int = typer.Argument(None),
     skip: bool = typer.Option(False, "--skip", help="Mark as skipped instead of done"),
 ):
-    """Mark a stage (or whole project) as done without launching Claude."""
+    """Mark a stage (or whole project) as done and clean up sessions."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
     if proj.stages:
         if stage_id is None:
-            # Default to the first running or next available stage
             stage = next((s for s in proj.stages if s.status == "running"), None)
             if stage is None:
                 stage = proj.next_available_stage()
@@ -2243,41 +2309,28 @@ def done(
                 console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
-            proj.status = "reviewed"
+            _kill_sessions(proj)
+            proj.status = "archived"
+            proj.dev_port = 0
+            proj.dev_session = ""
             update_project_note(proj)
-            console.print(
-                f"[green bold]All stages complete! Review changes, then: wb approve {proj.slug}[/green bold]"
-            )
+            console.print(f"[green bold]All stages complete — {proj.slug} archived.[/green bold]")
     else:
-        # No stages — mark the whole project
-        new_status = "reviewed" if not skip else "archived"
-        proj.status = new_status
+        _kill_sessions(proj)
+        proj.status = "archived"
+        proj.dev_port = 0
+        proj.dev_session = ""
         update_project_note(proj)
-        console.print(f"[green]{proj.slug} marked {new_status}.[/green]")
+        console.print(f"[green]{proj.slug} archived.[/green]")
 
 
 @app.command(rich_help_panel="Project Management")
 def archive(project: str = typer.Argument(autocompletion=complete_project)):
-    """Archive a project and clean up its background sessions."""
+    """Shelve a project — kill sessions but preserve sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
-    # Kill dev server session if running
-    if proj.dev_session and tmux_session_exists(proj.dev_session):
-        subprocess.run(["tmux", "kill-session", "-t", proj.dev_session], capture_output=True)
-        console.print(f"[dim]Killed dev session: {proj.dev_session}[/dim]")
-
-    # Kill CI monitor if running
-    ci_sess = f"wb-{proj.slug}-ci"
-    if tmux_session_exists(ci_sess):
-        subprocess.run(["tmux", "kill-session", "-t", ci_sess], capture_output=True)
-        console.print(f"[dim]Killed CI session: {ci_sess}[/dim]")
-
-    # Kill implement session if running
-    impl_sess = f"wb-{proj.slug}"
-    if tmux_session_exists(impl_sess):
-        subprocess.run(["tmux", "kill-session", "-t", impl_sess], capture_output=True)
-        console.print(f"[dim]Killed implement session: {impl_sess}[/dim]")
+    _kill_sessions(proj)
 
     proj.status = "archived"
     proj.dev_port = 0
@@ -2307,10 +2360,10 @@ def organize(
     raise typer.Exit(result.returncode)
 
 
-@app.command(rich_help_panel="Utilities")
+@app.command(hidden=True)
 def tui():
     """Launch the TUI workspace control panel in tmux."""
-    session = "wb-workspace"
+    session = "arc-workspace"
 
     # If session exists, just attach
     if tmux_session_exists(session):

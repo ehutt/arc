@@ -1,0 +1,42 @@
+# arc configuration
+# Copy this file to config.toml and customize for your setup.
+#
+# arc uses this config to find your Obsidian vault, target repo, and agent settings.
+
+[core]
+# Path to your Obsidian vault (~ is expanded)
+obsidian_vault = "~/path/to/your/obsidian-vault"
+
+# Folder inside the vault where project notes live
+projects_folder = "Projects"
+
+# Directory where arc creates isolated git clones (sandboxes)
+# Each project gets its own clone under this root
+sandbox_root = "~/Projects/my-repo-clones"
+
+# Git branch prefix for feature branches (e.g. "jdoe" → "jdoe/my-feature")
+branch_prefix = "your-username"
+
+[github]
+# Your GitHub username (used for filtering assigned issues in `arc sync`)
+user = "your-github-username"
+
+# The GitHub repo to pull issues from and open PRs against (org/repo format)
+repo = "org/repo-name"
+
+[agent]
+# Shell command to run tests in the sandbox (used by implementation and review agents)
+test_cmd = "pytest tests/"
+
+# Shell command to run linting in the sandbox
+lint_cmd = "make lint"
+
+[organize]
+# Folders in the vault to skip during daily organization
+skip_folders = ["Templates", ".obsidian", "Assets"]
+
+# Max notes to process per organizer run (limits API usage)
+max_notes_per_run = 20
+
+# Claude model used by the vault organizer
+model = "claude-sonnet-4-20250514"
