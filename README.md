@@ -1,15 +1,38 @@
 # arc
 
-A CLI for managing AI-assisted engineering projects. Each project lives as an Obsidian note with YAML frontmatter; `arc` drives the full lifecycle from GitHub issue to merged PR using Claude as the implementation agent and Codex for code review.
+A CLI for managing AI-assisted engineering projects end-to-end. Each project lives as an Obsidian note with YAML frontmatter; `arc` drives the full lifecycle from GitHub issue to merged PR using Claude for implementation and Codex (or Claude) for code review.
 
-## What it does
+## Why
 
-- Pulls your assigned GitHub issues and creates Obsidian project notes
-- Creates isolated git sandboxes (clones) per project with feature branches
-- Launches Claude to implement changes, then Codex to review them
-- Monitors CI, auto-fixes failures, and manages PRs
-- Runs multiple projects in parallel via tmux sessions
-- Keeps all state in human-readable Obsidian Markdown — no database
+When you're working on multiple features in parallel, context gets scattered — across GitHub issues, Obsidian notes, web clippings, and your git repo. You lose track of what's running where, which branch is which, and what still needs review.
+
+arc was built to solve this:
+
+- **Context management**: Pulls together GitHub issues, Obsidian notes, and repo state into a single project view. Plans, clippings, and related notes are automatically linked and fed to agents as context.
+- **Parallel development**: Each project gets its own isolated git clone (not a worktree — a full clone), its own feature branch, and optionally its own dev server, all sharing a common local database. No stepping on your own toes.
+- **At-a-glance status**: The dashboard shows all active projects — development and non-development — with their current stage, branch, PR status, and running tmux sessions.
+- **Automate the predictable parts**: Code review, CI monitoring, branch management, and PR creation are tedious but mechanical. arc handles them so you can focus on the interesting decisions.
+
+## Workflow
+
+```
+1. arc sync / arc new     →  Pull GitHub issues or create a project from scratch
+2. arc plan               →  Collect context from Obsidian + GitHub, break into stages
+3. arc sandbox / arc dev  →  Create isolated clone, optionally launch dev server
+4. arc implement          →  Claude implements (interactive or background)
+5. arc review             →  AI code review (Codex or Claude) + human review
+6. arc approve            →  Push, open PR, continuous CI monitor with auto-fix
+7. arc done / arc archive →  Mark complete, clean up sessions
+```
+
+## Highlights
+
+- **Not everything needs an agent** — arc makes it easy to jump between Obsidian, VS Code/Cursor, and the terminal. `arc note`, `arc editor`, and the dashboard are quick-nav commands, not AI wrappers.
+- **Separate implementation and review** — use Claude to implement, then Codex (or Claude with a different model) to review. Or skip AI review and review the diff yourself. The steps are decoupled.
+- **Obsidian as the knowledge layer** — project context, plans, clippings, and related notes all live in your vault. The vault organizer automatically tags and cross-links new notes to active projects.
+- **Project-aware Claude sessions** — the `ARC_PROJECT_SLUG` env var is set before every Claude launch, so your Claude Code status line and hooks can show which project you're working on.
+- **Full clones, not worktrees** — each sandbox is a complete git clone via `--reference`, so you get full isolation with minimal disk cost. Dev servers can run in parallel on different ports sharing a common local database.
+- **CI monitor with auto-fix** — after opening a PR, arc polls CI status and can automatically invoke Claude to fix failures and push.
 
 ## Quick start
 
@@ -18,9 +41,11 @@ A CLI for managing AI-assisted engineering projects. Each project lives as an Ob
 - Python 3.11+
 - [`uv`](https://github.com/astral-sh/uv) (script runner — `arc` uses uv inline scripts, no virtualenv needed)
 - [`claude`](https://github.com/anthropics/claude-code) CLI (Claude Code)
-- [`codex`](https://github.com/openai/codex) CLI — `npm install -g @openai/codex`
+- [`codex`](https://github.com/openai/codex) CLI — `npm install -g @openai/codex` (for code review; optional if using `--tool claude`)
 - [`gh`](https://cli.github.com/) CLI (authenticated)
 - `tmux`, `git`
+- [Obsidian](https://obsidian.md/) — all project state lives in your vault as Markdown notes
+- [VS Code](https://code.visualstudio.com/) or [Cursor](https://cursor.sh/) — `arc editor` opens sandboxes in your editor (use `--cursor` for Cursor)
 - macOS (uses `osascript` for notifications; Linux users can swap for `notify-send`)
 
 ### Setup
@@ -28,8 +53,7 @@ A CLI for managing AI-assisted engineering projects. Each project lives as an Ob
 ```bash
 git clone https://github.com/ehutt/arc.git
 cd arc
-cp config.example.toml config.toml
-# Edit config.toml with your paths and repo info (see Configuration below)
+arc init   # interactive config setup — or copy config.example.toml to config.toml
 ```
 
 Make `arc.py` your CLI entry point:
@@ -47,11 +71,12 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 ### First run
 
 ```bash
-arc sync          # Pull your assigned GitHub issues into Obsidian
-arc               # Dashboard — see all projects and their status
-arc plan <slug>   # Interactive Claude session to write a plan
+arc sync            # Pull your assigned GitHub issues into Obsidian
+arc                 # Dashboard — see all projects and their status
+arc plan <slug>     # Interactive Claude session to write a plan
 arc sandbox <slug>  # Create an isolated git clone with feature branch
-arc implement <slug>  # Claude implements → Codex reviews
+arc implement <slug>  # Claude implements
+arc review <slug>     # AI code review (codex by default, or --tool claude)
 arc approve <slug>    # Push, open PR, monitor CI
 ```
 
@@ -64,8 +89,8 @@ arc approve <slug>    # Push, open PR, monitor CI
 | `arc sync` | Pull GitHub issues and sync PR status from the configured repo |
 | `arc note <slug>` | Open a project's Obsidian note |
 | `arc new <title>` | Create a new project note without a GitHub issue |
-| `arc done <slug> [stage]` | Mark a stage (or whole project) as done and clean up sessions |
-| `arc archive <slug>` | Shelve a project — kill sessions but preserve sandbox |
+| `arc done <slug> [stage]` | Mark a stage (or whole project) as done — advances to next stage, archives when all stages complete. Kills sessions and cleans up. |
+| `arc archive <slug>` | Shelve a project without completing it — kills sessions but preserves the sandbox for later. Use when pausing or abandoning work. |
 | **Planning** | |
 | `arc plan <slug>` | Interactive Claude session to plan a project |
 | `arc stage <slug>` | Manage stages for a project |
@@ -75,9 +100,10 @@ arc approve <slug>    # Push, open PR, monitor CI
 | `arc editor <slug>` | Open sandbox in VS Code (or Cursor with `--cursor`) with changed files |
 | `arc dev <slug>` | Launch dev server in a background tmux session |
 | **Review & Ship** | |
+| `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override) |
 | `arc approve <slug>` | Push branch, create PR, and launch CI monitor |
-| `arc review <slug>` | Run AI code review on a project sandbox |
 | **Utilities** | |
+| `arc init` | Interactive setup — create `config.toml` from prompts |
 | `arc chat <slug>` | Informal Claude chat with project context |
 | `arc organize` | Run the vault organizer (tag & link notes) |
 
@@ -85,7 +111,7 @@ Status progresses automatically: `needs-plan` → `ready` → `implementing` →
 
 ## Configuration
 
-Copy `config.example.toml` to `config.toml` and edit it. The file is gitignored — your personal config stays local.
+Run `arc init` for interactive setup, or copy `config.example.toml` to `config.toml` and edit it. The file is gitignored — your personal config stays local.
 
 ```toml
 [core]
@@ -137,31 +163,112 @@ This section is written for a coding agent helping a new user set up arc for the
 
 ### Customizing the dev server command
 
-The `arc dev` command (line ~2098) launches a dev server in tmux. By default it runs `make dev` in the sandbox. To customize:
+The `arc dev` command launches a dev server in tmux. By default it runs `make dev` in the sandbox. To customize:
 
-1. **Change the launch command**: In `arc.py`, find the `dev_script` construction (line ~2213). The last line is `exec make -C "{sandbox_path}" dev`. Replace this with your app's dev server command (e.g. `exec npm run dev`, `exec cargo run`, etc.).
-2. **Change the default port**: The default port is `6006` (line ~2166). Change to whatever your dev server uses.
-3. **Phoenix-specific env vars**: The `PHOENIX_CLOUD_VARS` list (line ~2074) and `PHOENIX_WORKING_DIR` (line ~2119) are specific to the Phoenix app. Remove or replace these with env vars relevant to your app.
+1. **Change the launch command**: In `arc.py`, find the `dev_script` construction (search for `exec make`). Replace the last line with your app's dev server command (e.g. `exec npm run dev`, `exec cargo run`, etc.).
+2. **Change the default port**: The default port is `6006`. Change to whatever your dev server uses.
+3. **Phoenix-specific env vars**: The `PHOENIX_CLOUD_VARS` list and `PHOENIX_WORKING_DIR` are specific to the Phoenix app. Remove or replace these with env vars relevant to your app.
 
 ### Customizing environment variable injection
 
 arc injects env vars into agent subprocesses in two ways:
 
-1. **`MODEL_API_KEYS` list** (line ~2065): API keys carried into tmux sessions and agent subprocesses. Currently: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `KAGGLE_USERNAME`, `KAGGLE_KEY`. Add or remove keys as needed for your setup.
+1. **`MODEL_API_KEYS` list**: API keys carried into tmux sessions and agent subprocesses. Currently: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `KAGGLE_USERNAME`, `KAGGLE_KEY`. Add or remove keys as needed for your setup.
 
-2. **`_load_env_keys()` function** (line ~2081): Reads a `.env` file and loads matching keys into `os.environ`. The path is currently `cfg.sandbox_root.parent / "phoenix" / ".env"`. Point this at your repo's `.env` file, or remove it if you set env vars another way.
+2. **`_load_env_keys()` function**: Reads a `.env` file and loads matching keys into `os.environ`. The path is currently `cfg.sandbox_root.parent / "phoenix" / ".env"`. Point this at your repo's `.env` file, or remove it if you set env vars another way.
 
-3. **`_clean_env()` function** (line ~56): Strips conda/virtualenv paths from `PATH` before launching agents. This prevents Claude and Codex from seeing the wrong Python environment. If you don't use conda, this is harmless. If you use a different environment manager, you may need to adjust the path filters.
+3. **`_clean_env()` function**: Strips conda/virtualenv paths from `PATH` before launching agents. This prevents Claude and Codex from seeing the wrong Python environment. If you don't use conda, this is harmless. If you use a different environment manager, you may need to adjust the path filters.
 
-4. **`ARC_PROJECT_SLUG` env var** (line ~53): Set before launching Claude so that Claude Code hooks can identify which project is active. If you use Claude Code hooks, you can read this variable to customize behavior per-project.
+### Customizing the code review
 
-### Customizing the code review agent
+`arc review` defaults to Codex but supports both tools:
 
-The review step uses OpenAI Codex by default:
+```bash
+arc review <slug>                        # codex (default)
+arc review <slug> --tool claude          # claude instead
+arc review <slug> --model gpt-5.3-codex # codex with specific model
+arc review <slug> --tool claude -m claude-sonnet-4-20250514
+```
 
-1. **`CODEX_MODEL`** (line ~1182): The model used for code review. Currently `"gpt-5.3-codex"`.
-2. **Review prompt**: The `_codex_review()` function (line ~1185) constructs the review prompt. Modify the review instructions to match your team's standards.
-3. **To use a different reviewer** (e.g. Claude for both steps): Replace the `codex exec` call in `_codex_review()` and in the background orchestrator script (`_implement_bg()`).
+To change the default, edit `DEFAULT_REVIEW_TOOL` and `DEFAULT_REVIEW_MODEL` near the top of `_run_review()` in `arc.py`.
+
+### System prompts injected by arc
+
+arc injects system prompts into Claude and Codex at several points. You can customize these to match your team's conventions, coding standards, or review criteria. Each prompt includes project context (title, note content, plan) and task-specific instructions.
+
+| Command | Where in `arc.py` | What the prompt does |
+|---|---|---|
+| `arc plan` | `plan()` function | Instructs Claude to write a plan from the project note |
+| `arc implement` (interactive) | `_implement_interactive_simple()` and `_implement_interactive_staged()` | Gives Claude the project context, sandbox path, and git commit instructions |
+| `arc implement --bg` | `_implement_bg()` — writes a `CLAUDE.md` to the sandbox | Autonomous implementation instructions (read plan, implement, test, lint, commit) |
+| `arc implement --bg` | `_implement_bg()` — inline `-p` flag | One-line prompt passed to `claude` CLI in the orchestrator script |
+| `arc review` | `_run_review()` | Code quality review prompt: diff against main, check correctness, run tests/lint, fix issues |
+| `arc chat` | `chat()` function | Lightweight context prompt with project note content |
+| `arc approve` (CI fix) | CI monitor script in `approve()` | Instructs Claude to read CI failures, fix them, and push |
+
+The background orchestrator (`arc implement --bg`) also writes a `CLAUDE.md` file into the sandbox that Claude reads on startup. This file contains the full project note and implementation instructions.
+
+### Claude Code integration
+
+arc sets the `ARC_PROJECT_SLUG` environment variable before launching Claude sessions. This lets you customize Claude Code's behavior per-project using hooks and the status line.
+
+**Status line**: If you want your Claude Code status bar to show the active project, create `~/.claude/statusline.sh`:
+
+```bash
+#!/bin/bash
+input=$(cat)
+model=$(echo "$input" | jq -r '.model.display_name')
+cwd=$(echo "$input" | jq -r '.cwd')
+dir="${cwd##*/}"
+pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
+
+# Use arc project slug if available, otherwise directory name
+project="${ARC_PROJECT_SLUG:-$dir}"
+
+echo "[$model] $project | ${pct}% context"
+```
+
+Then in `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh"
+  }
+}
+```
+
+**Tab title hook**: To set your terminal tab/window title to the project name, create `~/.claude/hooks/set-iterm-title.sh`:
+
+```bash
+#!/bin/bash
+label="${ARC_PROJECT_SLUG:-$(basename "${CLAUDE_PROJECT_DIR:-unknown}")}"
+printf '\033]1;CC: %s\033\\' "$label"
+printf '\033]2;Claude Code — %s\033\\' "$label"
+```
+
+Then in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/set-iterm-title.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+These are optional — arc works without them. They just make it easier to track which project you're in when running multiple Claude sessions.
 
 ### Customizing the vault organizer
 
@@ -170,7 +277,7 @@ The review step uses OpenAI Codex by default:
 1. **Scheduling**: Set up a launchd plist (macOS) or cron job (Linux) to run `uv run --script organize.py` periodically.
 2. **API key**: The organizer looks for `ANTHROPIC_API_KEY` in the environment, then falls back to macOS Keychain (`security find-generic-password -a vault-organize -s ANTHROPIC_API_KEY`). Set whichever is convenient.
 3. **Model**: Configured via `organize.model` in `config.toml`.
-4. **System prompt**: The `SYSTEM_PROMPT` in `organize.py` (line ~248) describes the vault owner as "an AI engineer focused on LLM evaluation." Change this to match the user's domain for better tagging.
+4. **System prompt**: The `SYSTEM_PROMPT` in `organize.py` describes the vault owner as "an AI engineer focused on LLM evaluation." Change this to match the user's domain for better tagging.
 
 ## Architecture
 
@@ -190,15 +297,19 @@ The review step uses OpenAI Codex by default:
 
 | Session | Created by |
 |---|---|
-| `arc-{slug}` | `arc implement --bg` (autonomous implement + review) |
+| `arc-{slug}` | `arc implement --bg` (autonomous implementation) |
 | `arc-{slug}-ci` | `arc approve` (CI monitor loop) |
 | `arc-{slug}-dev` | `arc dev` (dev server) |
 
 ### Agent pipeline
 
-`arc implement` → Claude writes code → Codex reviews → you approve → `arc approve` → PR + CI monitor → auto-fix CI failures → merge
+```
+arc implement  →  Claude writes code  →  you review the diff
+arc review     →  AI code review (codex or claude)
+arc approve    →  PR + CI monitor  →  auto-fix CI failures  →  merge
+```
 
-In `--bg` mode, the entire pipeline runs in a tmux session with macOS notifications on completion.
+In `--bg` mode, implementation runs in a tmux session with macOS notifications on completion. Review is a separate step you run when ready.
 
 ## License
 

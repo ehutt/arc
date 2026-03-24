@@ -718,6 +718,69 @@ def dashboard(ctx: typer.Context):
         console.print("[dim]  attach sessions: tmux attach -t arc-<slug>[-ci][/dim]")
 
 
+@app.command(rich_help_panel="Utilities")
+def init():
+    """Interactive setup — create config.toml from prompts."""
+    config_path = Path(__file__).resolve().parent / "config.toml"
+    if config_path.exists():
+        overwrite = typer.confirm(f"config.toml already exists. Overwrite?", default=False)
+        if not overwrite:
+            raise typer.Exit(0)
+
+    console.print("[bold]arc setup[/bold]\n")
+
+    # Core
+    vault = typer.prompt(
+        "Obsidian vault path",
+        default="~/Documents/Obsidian",
+    )
+    projects_folder = typer.prompt("Projects folder inside vault", default="Projects")
+    sandbox_root = typer.prompt(
+        "Sandbox root (where git clones go)",
+        default="~/Projects/sandboxes",
+    )
+    branch_prefix = typer.prompt("Git branch prefix (e.g. your username)")
+
+    # GitHub
+    github_user = typer.prompt("GitHub username")
+    github_repo = typer.prompt("GitHub repo (org/name format)", default=f"{github_user}/my-repo")
+
+    # Agent
+    test_cmd = typer.prompt("Test command for sandboxes", default="pytest tests/")
+    lint_cmd = typer.prompt("Lint command for sandboxes", default="ruff check .")
+
+    # Organize
+    console.print("\n[dim]Vault organizer settings (press Enter to accept defaults):[/dim]")
+    max_notes = typer.prompt("Max notes per organizer run", default="20")
+    organize_model = typer.prompt("Claude model for organizer", default="claude-sonnet-4-20250514")
+
+    config_content = f"""\
+[core]
+obsidian_vault = "{vault}"
+projects_folder = "{projects_folder}"
+sandbox_root = "{sandbox_root}"
+branch_prefix = "{branch_prefix}"
+
+[github]
+user = "{github_user}"
+repo = "{github_repo}"
+
+[agent]
+test_cmd = "{test_cmd}"
+lint_cmd = "{lint_cmd}"
+
+[organize]
+skip_folders = ["Templates", ".obsidian", "Assets"]
+max_notes_per_run = {max_notes}
+model = "{organize_model}"
+"""
+
+    config_path.write_text(config_content)
+    console.print(f"\n[green]Config written to {config_path}[/green]")
+    console.print(f"  Edit anytime: [bold]{config_path}[/bold]")
+    console.print(f"  Next: [bold]arc sync[/bold] to pull issues, or [bold]arc new <title>[/bold] to start a project")
+
+
 @app.command(rich_help_panel="Project Management")
 def sync():
     """Pull GitHub issues and sync PR status from the configured repo."""
@@ -1179,7 +1242,7 @@ def implement(
         _implement_interactive_simple(cfg, proj, sandbox_path)
 
 
-DEFAULT_REVIEW_TOOL = "claude"
+DEFAULT_REVIEW_TOOL = "codex"
 DEFAULT_REVIEW_MODEL = ""  # empty = tool default
 
 
