@@ -428,6 +428,7 @@ def _migrate_project(proj: Project) -> None:
     # Map old stage statuses
     _stage_status_map = {
         "running": "implemented",
+        "todo": "pending",
     }
     for s in proj.stages:
         if s.status in _stage_status_map:
