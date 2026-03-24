@@ -1179,14 +1179,24 @@ def implement(
         _implement_interactive_simple(cfg, proj, sandbox_path)
 
 
-CODEX_MODEL = "gpt-5.3-codex"
+DEFAULT_REVIEW_TOOL = "claude"
+DEFAULT_REVIEW_MODEL = ""  # empty = tool default
 
 
-def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context: str = "") -> None:
-    """Run code review with Codex (gpt-5.3-codex) after Claude implementation."""
+def _run_review(
+    cfg: Config,
+    proj: Project,
+    sandbox_path: Path,
+    stage_context: str = "",
+    tool: str = DEFAULT_REVIEW_TOOL,
+    model: str = DEFAULT_REVIEW_MODEL,
+) -> None:
+    """Run AI code review using claude or codex."""
     console.print()
-    console.print("[bold cyan]Starting Codex code review...[/bold cyan]")
-    console.print(f"[dim]Model: {CODEX_MODEL}[/dim]")
+    tool_label = tool
+    if model:
+        tool_label += f" ({model})"
+    console.print(f"[bold cyan]Starting code review with {tool_label}...[/bold cyan]")
 
     proj.status = "reviewing"
     update_project_note(proj)
@@ -1226,19 +1236,20 @@ def _codex_review(cfg: Config, proj: Project, sandbox_path: Path, stage_context:
         IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
     """)
 
-    subprocess.run(
-        [
-            "codex",
-            "-m",
-            CODEX_MODEL,
-            "-C",
-            str(sandbox_path),
-            review_prompt,
-        ],
-        env=_clean_env(),
-    )
+    if tool == "codex":
+        cmd = ["codex"]
+        if model:
+            cmd += ["-m", model]
+        cmd += ["-C", str(sandbox_path), review_prompt]
+    else:
+        cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
+        if model:
+            cmd += ["--model", model]
+        cmd += ["--system-prompt", review_prompt, "Review the implementation."]
 
-    console.print("[green]Codex review complete.[/green]")
+    subprocess.run(cmd, cwd=sandbox_path, env=_clean_env())
+
+    console.print(f"[green]{tool} review complete.[/green]")
 
     proj.status = "reviewed"
     update_project_note(proj)
@@ -1320,12 +1331,6 @@ def _implement_interactive_staged(
     set_tab_title("")
 
     append_session_note(proj, "implement", f"Stage {stage.id} ({stage.name}) implementation completed")
-
-    # Codex review with stage context
-    stage_ctx = f"Reviewing stage {stage.id}: {stage.name}"
-    if plan_content:
-        stage_ctx += f"\n\n{plan_content}"
-    _codex_review(cfg, proj, sandbox_path, stage_context=stage_ctx)
 
     # Post-exit prompt
     console.print()
@@ -1410,21 +1415,14 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
 
     append_session_note(proj, "implement", f"Implementation session for {proj.title}")
 
-    # Codex review
-    _codex_review(cfg, proj, sandbox_path)
-
     console.print()
-    choice = input("Ready to approve? [Y/n] ").strip().lower()
-    if choice in ("", "y", "yes"):
-        console.print(f"[green]Ready for approval. Run: arc approve {proj.slug}[/green]")
-    else:
-        proj.status = "implementing"
-        update_project_note(proj)
-        console.print(f"[dim]Project still implementing. Re-run: arc implement {proj.slug}[/dim]")
+    console.print(f"[green]Implementation complete.[/green]")
+    console.print(f"  Review: [bold]arc review {proj.slug}[/bold]")
+    console.print(f"  Approve: [bold]arc approve {proj.slug}[/bold]")
 
 
 def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
-    """Autonomous implement → review pipeline in tmux background."""
+    """Autonomous implementation in tmux background."""
     note_content = proj.path.read_text() if proj.path else ""
 
     claude_md = textwrap.dedent(f"""\
@@ -1447,37 +1445,6 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         {note_content}
     """)
     (sandbox_path / "CLAUDE.md").write_text(claude_md)
-
-    # Build Codex review prompt with full project context
-    plans_context = ""
-    if proj.stages and proj.folder:
-        for s in proj.stages:
-            if s.plan:
-                plan_path = proj.folder / s.plan
-                if plan_path.exists():
-                    plans_context += f"\n### Stage {s.id}: {s.name}\n{plan_path.read_text()}\n"
-
-    codex_review_prompt = textwrap.dedent(f"""\
-        You are reviewing an implementation for project: {proj.title}
-
-        ## Project Documentation
-        {note_content}
-
-        {f"## Implementation Plans{plans_context}" if plans_context else ""}
-
-        ## Review Instructions
-        Your primary job is a **code quality review**: focus on feature behavior correctness, edge cases, API ergonomics, logic errors, and subtle bugs.
-
-        1. Run `git diff main` to see all changes
-        2. Review each changed file for correctness against the project requirements and plans above
-        3. Look for: logic errors, missed edge cases, off-by-one bugs, incorrect API usage, poor error messages, naming issues
-        4. As a secondary check, run tests (`{cfg.test_cmd}`) and lint (`{cfg.lint_cmd}`)
-        5. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
-        6. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
-
-        IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
-    """)
-    codex_review_prompt_escaped = codex_review_prompt.replace("'", "'\\''")
 
     project_note_path = str(proj.path) if proj.path else ""
 
@@ -1537,55 +1504,9 @@ if notes_match:
     p.write_text(text)
 "
 
-        echo "=== arc: Implementation done, starting Codex review ({CODEX_MODEL}) ==="
-
-        python3 -c "
-import re
-from pathlib import Path
-p = Path('{project_note_path}')
-text = p.read_text()
-text = re.sub(r'status: \\w[\\w-]*', 'status: reviewing', text, count=1)
-p.write_text(text)
-"
-
-        codex exec --dangerously-bypass-approvals-and-sandbox -m {CODEX_MODEL} '{codex_review_prompt_escaped}'
-
-        python3 -c "
-import re
-from datetime import datetime
-from pathlib import Path
-p = Path('{project_note_path}')
-text = p.read_text()
-today = datetime.now().strftime('%Y-%m-%d')
-entry = '- **review**: Codex ({CODEX_MODEL}) code review completed'
-notes_match = re.search(r'^## Notes\\s*$', text, re.MULTILINE)
-if notes_match:
-    import re as _re
-    today_pat = _re.compile(r'^### ' + _re.escape(today) + r'\\s*$', _re.MULTILINE)
-    tm = today_pat.search(text, notes_match.end())
-    if tm:
-        next_h = _re.search(r'^##', text[tm.end():], _re.MULTILINE)
-        pos = tm.end() + next_h.start() if next_h else len(text)
-        text = text[:pos].rstrip() + '\\n' + entry + '\\n' + text[pos:]
-    else:
-        text = text[:notes_match.end()] + '\\n### ' + today + '\\n' + entry + '\\n' + text[notes_match.end():]
-    p.write_text(text)
-"
-
-        echo "=== arc: Codex review complete ==="
-
-        python3 -c "
-import re
-from pathlib import Path
-p = Path('{project_note_path}')
-text = p.read_text()
-text = re.sub(r'status: \\w[\\w-]*', 'status: reviewed', text, count=1)
-p.write_text(text)
-"
-
-        osascript -e 'display notification "AI review complete for {proj.slug}. Ready for your review." with title "arc: {proj.slug}"'
+        osascript -e 'display notification "Implementation complete for {proj.slug}. Run: arc review {proj.slug}" with title "arc: {proj.slug}"'
         echo -e "\\a"
-        echo "=== arc: {proj.slug} AI review complete. Review changes, then: arc approve {proj.slug} ==="
+        echo "=== arc: {proj.slug} implementation complete. Review with: arc review {proj.slug} ==="
     """)
 
     script_path = sandbox_path / ".arc-orchestrate.sh"
@@ -1992,10 +1913,20 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
 @app.command(rich_help_panel="Review & Ship")
 def review(
     project: str = typer.Argument(autocompletion=complete_project),
+    tool: str = typer.Option(
+        DEFAULT_REVIEW_TOOL, "--tool", "-t", help="Review tool: 'claude' or 'codex'"
+    ),
+    model: str = typer.Option(
+        DEFAULT_REVIEW_MODEL, "--model", "-m", help="Model override (e.g. 'gpt-5.3-codex', 'claude-sonnet-4-20250514')"
+    ),
 ):
     """Run AI code review on a project sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
+
+    if tool not in ("claude", "codex"):
+        console.print(f"[red]Unknown tool '{tool}'. Use 'claude' or 'codex'.[/red]")
+        raise typer.Exit(1)
 
     if not proj.sandbox or not Path(proj.sandbox).exists():
         console.print(f"[red]No sandbox found. Run: arc sandbox {proj.slug}[/red]")
@@ -2004,7 +1935,7 @@ def review(
     sandbox_path = Path(proj.sandbox)
 
     set_tab_title(f"arc: {project} (review)")
-    _codex_review(cfg, proj, sandbox_path)
+    _run_review(cfg, proj, sandbox_path, tool=tool, model=model)
     set_tab_title("")
 
 
