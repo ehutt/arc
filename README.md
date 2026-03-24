@@ -1,12 +1,18 @@
 # arc
 
-A CLI for managing AI-assisted engineering projects end-to-end. Each project lives as an Obsidian note with YAML frontmatter; `arc` drives the full lifecycle from GitHub issue to merged PR using Claude for implementation and Codex (or Claude) for code review.
+A CLI for tracking the arc of AI-assisted projects end-to-end. Each project lives as an Obsidian note with YAML frontmatter; `arc` drives the full lifecycle from GitHub issue to merged PR using Claude for implementation and Codex (or Claude) for code review.
 
 ## Why
 
-When you're working on multiple features in parallel, context gets scattered — across GitHub issues, Obsidian notes, web clippings, and your git repo. You lose track of what's running where, which branch is which, and what still needs review.
+I built arc for myself. I'm an AI engineer at [Arize AI](https://arize.com), where I split my time between building [Phoenix](https://github.com/Arize-ai/phoenix) (our open-source LLM observability platform) and creating educational content — courses, talks, blog posts, benchmarks. I'm often juggling 5-10 projects at once across both tracks, and I needed a tool that could keep up.
 
-arc was built to solve this:
+arc is opinionated. It reflects my specific workflow: Obsidian for knowledge management, Claude for implementation, Codex for code review, tmux for session management, GitHub for PRs. It bakes in the development patterns and review preferences I've landed on after months of working this way.
+
+That said, the problems it solves are general. If you're managing multiple AI-assisted projects and feeling the friction of context switching, scattered state, and manual bookkeeping, arc might be useful to you as-is — or as a starting point for building your own version. The [customization guide](#customization-guide) is written specifically to help a coding agent adapt arc to your repo, your tools, and your workflow.
+
+When you're working on multiple features in parallel, context gets scattered — across GitHub issues, Obsidian notes, web clippings, and your git repo. You lose track of what's running where, which branch is which, and the current stage of ongoing projects.
+
+The specific problems arc solves:
 
 - **Context management**: Pulls together GitHub issues, Obsidian notes, and repo state into a single project view. Plans, clippings, and related notes are automatically linked and fed to agents as context.
 - **Parallel development**: Each project gets its own isolated git clone (not a worktree — a full clone), its own feature branch, and optionally its own dev server, all sharing a common local database. No stepping on your own toes.
@@ -68,17 +74,6 @@ ln -s ~/path/to/arc/arc.py ~/.local/bin/arc
 
 Project slug autocompletion is built in via Typer — tab-complete works for all commands that take a `<slug>` argument.
 
-### First run
-
-```bash
-arc sync            # Pull your assigned GitHub issues into Obsidian
-arc                 # Dashboard — see all projects and their status
-arc plan <slug>     # Interactive Claude session to write a plan
-arc sandbox <slug>  # Create an isolated git clone with feature branch
-arc implement <slug>  # Claude implements
-arc review <slug>     # AI code review (codex by default, or --tool claude)
-arc approve <slug>    # Push, open PR, monitor CI
-```
 
 ## Commands
 
@@ -176,8 +171,6 @@ model = "claude-sonnet-4-20250514"
 | `organize.model` | Claude model for the vault organizer | `"claude-sonnet-4-20250514"` |
 
 ## Customization guide
-
-This section is written for a coding agent helping a new user set up arc for their own repo and workflow.
 
 ### Pointing arc at a different repo
 
