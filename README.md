@@ -58,20 +58,25 @@ arc approve <slug>    # Push, open PR, monitor CI
 | Command | Description |
 |---|---|
 | `arc` | Dashboard: status, stage progress, branches, tmux sessions |
-| `arc new <title>` | Create a project note from scratch (no GitHub issue needed) |
-| `arc sync` | Pull assigned GitHub issues; create/attach project notes |
-| `arc plan <slug>` | Interactive Claude session to write a plan |
-| `arc stage <slug>` | List, add, or plan stages for a project |
-| `arc sandbox <slug>` | Create an isolated git clone with a feature branch |
-| `arc implement <slug>` | Claude implementation → automatic Codex code review |
-| `arc implement <slug> --bg` | Same, but runs autonomously in a tmux session |
-| `arc done <slug> [stage]` | Mark a stage done (or `--skip`) |
-| `arc approve <slug>` | Push branch, create PR via `gh`, launch CI monitor |
-| `arc dev <slug>` | Launch your app's dev server in background tmux |
-| `arc archive <slug>` | Archive a project and kill all background sessions |
-| `arc open <slug>` | Open project note in Obsidian |
+| **Project Management** | |
+| `arc sync` | Pull GitHub issues and sync PR status from the configured repo |
+| `arc note <slug>` | Open a project's Obsidian note |
+| `arc new <title>` | Create a new project note without a GitHub issue |
+| `arc done <slug> [stage]` | Mark a stage (or whole project) as done and clean up sessions |
+| `arc archive <slug>` | Shelve a project — kill sessions but preserve sandbox |
+| **Planning** | |
+| `arc plan <slug>` | Interactive Claude session to plan a project |
+| `arc stage <slug>` | Manage stages for a project |
+| **Development** | |
+| `arc sandbox <slug>` | Create an isolated git clone (worktree) with a feature branch |
+| `arc implement <slug>` | Claude implementation; add `--bg` for autonomous mode in tmux |
+| `arc editor <slug>` | Open sandbox in VS Code (or Cursor with `--cursor`) with changed files |
+| `arc dev <slug>` | Launch dev server in a background tmux session |
+| **Review & Ship** | |
+| `arc approve <slug>` | Push branch, create PR, and launch CI monitor |
+| `arc review <slug>` | Run AI code review on a project sandbox |
+| **Utilities** | |
 | `arc chat <slug>` | Informal Claude chat with project context |
-| `arc cursor <slug>` | Open sandbox in Cursor with changed files |
 | `arc organize` | Run the vault organizer (tag & link notes) |
 
 Status progresses automatically: `needs-plan` → `ready` → `implementing` → `reviewing` → `awaiting-approval` → `pr-open` → `archived`
