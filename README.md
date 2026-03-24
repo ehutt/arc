@@ -262,7 +262,7 @@ Then in `~/.claude/settings.json`:
 }
 ```
 
-**Tab title hook**: To set your terminal tab/window title to the project name, create `~/.claude/hooks/set-iterm-title.sh`:
+**Tab title hook**: To set your terminal tab/window title to the project name, create a hook script (e.g. `~/.claude/hooks/set-tab-title.sh`):
 
 ```bash
 #!/bin/bash
@@ -282,7 +282,7 @@ Then in `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "bash ~/.claude/hooks/set-iterm-title.sh"
+            "command": "bash ~/.claude/hooks/set-tab-title.sh"
           }
         ]
       }

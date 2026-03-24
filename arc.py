@@ -709,7 +709,7 @@ def relative_time(date_str: str) -> str:
 
 
 def set_tab_title(title: str) -> None:
-    """Set the iTerm/terminal tab title via escape sequence."""
+    """Set terminal tab title via standard xterm escape sequence."""
     sys.stdout.write(f"\033]1;{title}\007")
     sys.stdout.flush()
 
