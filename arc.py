@@ -92,34 +92,28 @@ app = typer.Typer(
 )
 console = Console()
 
-STATUSES = [
-    "needs-plan",
-    "ready",
-    "implementing",
-    "reviewing",
-    "reviewed",
-    "awaiting-approval",
-    "pr-open",
-    "ci-checking",
-    "ci-failing",
-    "ci-passing",
-    "pr-approved",
-    "archived",
-]
+# Project-level statuses (derived from stages when stages exist)
+PROJECT_STATUSES = ["needs-plan", "planned", "active", "done", "archived"]
 
-STATUS_COLORS = {
+PROJECT_STATUS_COLORS = {
     "needs-plan": "dim",
-    "ready": "green",
-    "implementing": "yellow",
-    "reviewing": "yellow",
-    "reviewed": "cyan",
-    "awaiting-approval": "cyan",
-    "pr-open": "magenta",
-    "ci-checking": "magenta",
-    "ci-failing": "red",
-    "ci-passing": "green",
-    "pr-approved": "green",
+    "planned": "cyan",
+    "active": "yellow",
+    "done": "green",
     "archived": "dim",
+}
+
+# Stage-level statuses (past tense)
+STAGE_STATUSES = ["pending", "ready", "implemented", "reviewed", "pr-open", "done", "skipped"]
+
+STAGE_STATUS_COLORS = {
+    "pending": "dim",
+    "ready": "green",
+    "implemented": "yellow",
+    "reviewed": "cyan",
+    "pr-open": "magenta",
+    "done": "green",
+    "skipped": "dim",
 }
 
 # ---------------------------------------------------------------------------
@@ -175,18 +169,27 @@ def load_config() -> Config:
 class Stage:
     id: int
     name: str
-    status: str = "pending"  # pending | running | done | skipped
-    plan: str = ""  # relative path within project folder
+    status: str = "pending"  # pending | ready | implemented | reviewed | pr-open | done | skipped
     depends_on: list[int] = field(default_factory=list)
+    github_issues: list[str] = field(default_factory=list)
+    github_prs: list[str] = field(default_factory=list)
+
+    def folder_name(self) -> str:
+        """Conventional folder name: '{id}-{slugified-name}'."""
+        return f"{self.id}-{slugify(self.name)}"
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "id": self.id,
             "name": self.name,
             "status": self.status,
-            "plan": self.plan,
             "depends_on": self.depends_on,
         }
+        if self.github_issues:
+            d["github_issues"] = self.github_issues
+        if self.github_prs:
+            d["github_prs"] = self.github_prs
+        return d
 
 
 @dataclass
@@ -204,7 +207,6 @@ class Project:
     sandbox: str = ""
     branch: str = ""
     related_notes: list[str] = field(default_factory=list)
-    plans: list[str] = field(default_factory=list)
     stages: list[Stage] = field(default_factory=list)
     dev_port: int = 0
     dev_session: str = ""
@@ -222,13 +224,15 @@ class Project:
 
     @property
     def status_color(self) -> str:
-        return STATUS_COLORS.get(self.derived_status, "white")
+        return PROJECT_STATUS_COLORS.get(self.derived_status, "white")
 
     @property
     def derived_status(self) -> str:
+        if self.status == "archived":
+            return "archived"
         if not self.stages:
             return self.status
-        return derive_project_status(self.stages, self.status)
+        return derive_project_status(self.stages)
 
     def obsidian_url(self, cfg: Config) -> str:
         vault_name = cfg.obsidian_vault.name
@@ -252,7 +256,6 @@ class Project:
             "sandbox": self.sandbox,
             "branch": self.branch,
             "related_notes": self.related_notes,
-            "plans": self.plans,
         }
         if self.stages:
             d["stages"] = [s.to_dict() for s in self.stages]
@@ -269,19 +272,15 @@ class Project:
         return f"{done}/{len(self.stages)}"
 
     def next_available_stage(self) -> Stage | None:
-        done_ids = {s.id for s in self.stages if s.status in ("done", "skipped")}
+        """Return the first 'ready' stage (dependencies met)."""
         for s in sorted(self.stages, key=lambda x: x.id):
-            if s.status == "pending" and all(d in done_ids for d in s.depends_on):
+            if s.status == "ready":
                 return s
         return None
 
     def unblocked_stages(self) -> list[Stage]:
-        done_ids = {s.id for s in self.stages if s.status in ("done", "skipped")}
-        return [
-            s
-            for s in self.stages
-            if s.status == "pending" and all(d in done_ids for d in s.depends_on)
-        ]
+        """Return all stages that are 'ready'."""
+        return [s for s in self.stages if s.status == "ready"]
 
     def get_stage(self, stage_id: int) -> Stage | None:
         for s in self.stages:
@@ -295,27 +294,26 @@ class Project:
         return [s for s in self.stages if s.id in blocking_ids]
 
 
-def derive_project_status(stages: list[Stage], manual_status: str = "") -> str:
+def derive_project_status(stages: list[Stage]) -> str:
+    """Derive project status from stage statuses."""
     if not stages:
-        return manual_status or "needs-plan"
-    # Compute stage-based status
-    if all(s.status in ("done", "skipped") for s in stages):
-        stage_status = "reviewed"
-    elif "running" in {s.status for s in stages}:
-        stage_status = "implementing"
-    elif all(s.status == "pending" for s in stages):
-        stage_status = "ready"
-    else:
-        stage_status = "implementing"
+        return "needs-plan"
+    statuses = {s.status for s in stages}
+    if all(s in ("done", "skipped") for s in statuses):
+        return "done"
+    # Anything beyond pending/ready/done/skipped means active work
+    if statuses - {"pending", "ready", "done", "skipped"}:
+        return "active"
+    return "planned"
 
-    # Allow manual lifecycle overrides for post-completion states
-    _ci_statuses = ("ci-checking", "ci-failing", "ci-passing", "pr-approved")
-    if manual_status in ("reviewing", "awaiting-approval", "pr-open", *_ci_statuses, "archived"):
-        if manual_status == "reviewing" and stage_status in ("implementing", "reviewed"):
-            return "reviewing"
-        if manual_status in ("awaiting-approval", "pr-open", *_ci_statuses, "archived") and stage_status == "reviewed":
-            return manual_status
-    return stage_status
+
+def auto_promote_ready(project: Project) -> None:
+    """Promote stages from 'pending' to 'ready' when all dependencies are met."""
+    done_ids = {s.id for s in project.stages if s.status in ("done", "skipped")}
+    for s in project.stages:
+        if s.status == "pending":
+            if not s.depends_on or all(d in done_ids for d in s.depends_on):
+                s.status = "ready"
 
 
 def parse_project(path: Path) -> Project | None:
@@ -343,11 +341,12 @@ def parse_project(path: Path) -> Project | None:
                     id=raw_stage.get("id", 0),
                     name=raw_stage.get("name", ""),
                     status=raw_stage.get("status", "pending"),
-                    plan=raw_stage.get("plan", ""),
                     depends_on=raw_stage.get("depends_on", []),
+                    github_issues=raw_stage.get("github_issues", []),
+                    github_prs=raw_stage.get("github_prs", []),
                 )
             )
-    return Project(
+    proj = Project(
         title=fm.get("title", path.stem),
         slug=fm["slug"],
         status=fm.get("status", "needs-plan"),
@@ -360,12 +359,14 @@ def parse_project(path: Path) -> Project | None:
         sandbox=fm.get("sandbox", ""),
         branch=fm.get("branch", ""),
         related_notes=fm.get("related_notes", []),
-        plans=fm.get("plans", []),
         stages=stages,
         dev_port=_safe_int(fm.get("dev_port", 0)),
         dev_session=fm.get("dev_session", ""),
         path=path,
     )
+    if proj.stages:
+        auto_promote_ready(proj)
+    return proj
 
 
 def load_projects(cfg: Config) -> list[Project]:
@@ -379,8 +380,62 @@ def load_projects(cfg: Config) -> list[Project]:
             if index.exists():
                 p = parse_project(index)
                 if p:
+                    _migrate_project(p)
                     projects.append(p)
     return projects
+
+
+def _migrate_project(proj: Project) -> None:
+    """Migrate old-format projects: extract ## Notes to notes.md, map old statuses."""
+    if not proj.folder or not proj.path:
+        return
+
+    # Extract ## Notes from index.md into notes.md if present
+    notes_file = proj.folder / "notes.md"
+    if not notes_file.exists():
+        text = proj.path.read_text()
+        notes_match = re.search(r"^## Notes\s*$", text, re.MULTILINE)
+        if notes_match:
+            notes_content = text[notes_match.end():]
+            # Trim at next ## heading (if any other section follows)
+            next_section = re.search(r"^## (?!Notes)", notes_content, re.MULTILINE)
+            if next_section:
+                notes_content = notes_content[:next_section.start()]
+            notes_file.write_text(notes_content.strip() + "\n")
+            # Remove ## Notes from index.md
+            if next_section:
+                new_text = text[:notes_match.start()] + text[notes_match.end() + next_section.start():]
+            else:
+                new_text = text[:notes_match.start()].rstrip() + "\n"
+            proj.path.write_text(new_text)
+
+    # Map old statuses to new ones
+    _status_map = {
+        "ready": "planned",
+        "implementing": "active",
+        "reviewing": "active",
+        "reviewed": "active",
+        "awaiting-approval": "active",
+        "ci-checking": "active",
+        "ci-failing": "active",
+        "ci-passing": "active",
+        "pr-approved": "active",
+        "pr-open": "active",
+    }
+    if proj.status in _status_map:
+        proj.status = _status_map[proj.status]
+
+    # Map old stage statuses
+    _stage_status_map = {
+        "running": "implemented",
+    }
+    for s in proj.stages:
+        if s.status in _stage_status_map:
+            s.status = _stage_status_map[s.status]
+
+    # Create stage folders if they don't exist
+    if proj.stages:
+        ensure_stage_folders(proj)
 
 
 def find_project(cfg: Config, slug: str) -> Project:
@@ -425,9 +480,10 @@ def update_project_note(project: Project) -> None:
     m = re.match(r"^---\n.+?\n---\n?", text, re.DOTALL)
     body = text[m.end() :] if m else text
     project.updated = datetime.now().strftime("%Y-%m-%d")
-    _no_derive = ("awaiting-approval", "pr-open", "ci-checking", "ci-failing", "ci-passing", "pr-approved", "archived")
-    if project.stages and project.status not in _no_derive:
-        project.status = derive_project_status(project.stages, project.status)
+    if project.stages:
+        auto_promote_ready(project)
+        if project.status != "archived":
+            project.status = derive_project_status(project.stages)
     fm = yaml.dump(project.frontmatter_dict(), default_flow_style=False, sort_keys=False)
     project.path.write_text(f"---\n{fm}---\n{body}")
 
@@ -457,15 +513,17 @@ def create_project_note(
 
     ## Tasks
     (filled during arc plan)
-
-    ## Spec
-    (filled during arc plan)
-
-    ## Notes
-    ### {today}
-    - Created{f" from issue {github_issue}" if github_issue else ""}
     """)
     note_path.write_text(f"---\n{fm}---\n{note_body}")
+
+    # Create project-level notes.md
+    notes_path = project_dir / "notes.md"
+    if not notes_path.exists():
+        notes_path.write_text(
+            f"# {title} — Notes\n\n### {today}\n"
+            f"- Created{f' from issue {github_issue}' if github_issue else ''}\n"
+        )
+
     return project
 
 
@@ -476,41 +534,80 @@ def slugify(text: str) -> str:
     return re.sub(r"-+", "-", s).strip("-")[:60]
 
 
-def append_session_note(project: Project, session_type: str, summary: str) -> None:
-    """Append a dated session entry under ## Notes in the project note."""
-    if not project.path or not project.path.exists():
+# ---------------------------------------------------------------------------
+# Project folder helpers
+# ---------------------------------------------------------------------------
+
+
+def stage_folder(project: Project, stage: Stage) -> Path:
+    """Return the path to a stage's folder: Projects/<slug>/stages/<id>-<name>/"""
+    assert project.folder is not None
+    return project.folder / "stages" / stage.folder_name()
+
+
+def stage_plan_path(project: Project, stage: Stage) -> Path:
+    return stage_folder(project, stage) / "plan.md"
+
+
+def stage_notes_path(project: Project, stage: Stage) -> Path:
+    return stage_folder(project, stage) / "notes.md"
+
+
+def project_notes_path(project: Project) -> Path:
+    """Return the path to the project-level notes.md."""
+    assert project.folder is not None
+    return project.folder / "notes.md"
+
+
+def ensure_stage_folders(project: Project) -> None:
+    """Create stage folders with plan.md and notes.md if they don't exist."""
+    if not project.folder:
         return
-    text = project.path.read_text()
+    for s in project.stages:
+        sf = stage_folder(project, s)
+        sf.mkdir(parents=True, exist_ok=True)
+        for fname in ("plan.md", "notes.md"):
+            fpath = sf / fname
+            if not fpath.exists():
+                fpath.write_text("")
+
+
+def _append_to_notes_file(notes_path: Path, session_type: str, summary: str) -> None:
+    """Append a dated entry to a notes.md file."""
+    notes_path.parent.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     entry = f"- **{session_type}**: {summary}"
 
-    # Find ## Notes section
-    notes_match = re.search(r"^## Notes\s*$", text, re.MULTILINE)
-    if not notes_match:
-        # No ## Notes section — append one
-        text = text.rstrip() + f"\n\n## Notes\n### {today}\n{entry}\n"
-        project.path.write_text(text)
+    if not notes_path.exists() or notes_path.stat().st_size == 0:
+        notes_path.write_text(f"### {today}\n{entry}\n")
         return
 
-    notes_start = notes_match.end()
-
-    # Check if ### {today} subsection already exists
+    text = notes_path.read_text()
     today_pattern = re.compile(rf"^### {re.escape(today)}\s*$", re.MULTILINE)
-    today_match = today_pattern.search(text, notes_start)
+    today_match = today_pattern.search(text)
     if today_match:
-        # Find the end of this subsection (next ### or ## or end of file)
-        next_heading = re.search(r"^##", text[today_match.end():], re.MULTILINE)
+        next_heading = re.search(r"^###", text[today_match.end():], re.MULTILINE)
         if next_heading:
             insert_pos = today_match.end() + next_heading.start()
         else:
             insert_pos = len(text)
-        # Insert entry before the next heading (or at end)
         text = text[:insert_pos].rstrip() + f"\n{entry}\n" + text[insert_pos:]
     else:
-        # Insert new ### {today} heading right after ## Notes
-        text = text[:notes_start] + f"\n### {today}\n{entry}\n" + text[notes_start:]
+        text = text.rstrip() + f"\n\n### {today}\n{entry}\n"
 
-    project.path.write_text(text)
+    notes_path.write_text(text)
+
+
+def append_session_note(
+    project: Project, session_type: str, summary: str, stage: Stage | None = None
+) -> None:
+    """Append a dated session entry to the appropriate notes.md file."""
+    if not project.folder:
+        return
+    if stage is not None:
+        _append_to_notes_file(stage_notes_path(project, stage), session_type, summary)
+    else:
+        _append_to_notes_file(project_notes_path(project), session_type, summary)
 
 
 # ---------------------------------------------------------------------------
@@ -639,19 +736,17 @@ def dashboard(ctx: typer.Context):
     term_width = min(console.width, 140)
     table = Table(show_header=True, header_style="bold", padding=(0, 2), width=term_width)
     table.add_column("Project", style="bold", no_wrap=True)
-    table.add_column("Stage", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
     table.add_column("Progress", no_wrap=True)
     table.add_column("PR", no_wrap=True)
     table.add_column("Branch", no_wrap=True, overflow="ellipsis", max_width=30)
     table.add_column("Sessions", no_wrap=True)
     table.add_column("Updated", justify="right", no_wrap=True)
 
-    status_order = {s: i for i, s in enumerate(STATUSES)}
+    status_order = {s: i for i, s in enumerate(PROJECT_STATUSES)}
     projects.sort(
         key=lambda p: (
-            0
-            if p.derived_status in ("implementing", "reviewing", "reviewed", "awaiting-approval")
-            else 1,
+            0 if p.derived_status == "active" else 1,
             status_order.get(p.derived_status, 99),
         )
     )
@@ -659,10 +754,13 @@ def dashboard(ctx: typer.Context):
     has_tmux_sessions = False
 
     for p in projects:
-        # PR link
+        # PR link — aggregate from project + all stages
+        all_prs = list(p.github_prs)
+        for s in p.stages:
+            all_prs.extend(s.github_prs)
         pr_display = "[dim]—[/dim]"
-        if p.github_prs:
-            pr_url = p.github_prs[-1]
+        if all_prs:
+            pr_url = all_prs[-1]
             pr_match = re.search(r"/pull/(\d+)", pr_url)
             if pr_match:
                 pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
@@ -699,7 +797,7 @@ def dashboard(ctx: typer.Context):
 
         url = p.obsidian_url(cfg)
         status = p.derived_status
-        color = STATUS_COLORS.get(status, "white")
+        color = PROJECT_STATUS_COLORS.get(status, "white")
 
         status_display = status
 
@@ -904,9 +1002,6 @@ def sync():
                     pr_ref = pr["url"]
                     if pr_ref not in p.github_prs:
                         p.github_prs.append(pr_ref)
-                        _pr_statuses = ("pr-open", "ci-checking", "ci-failing", "ci-passing", "pr-approved", "archived")
-                        if p.status not in _pr_statuses:
-                            p.status = "pr-open"
                         update_project_note(p)
                         console.print(f"  Updated {p.slug} with PR #{pr['number']}")
 
@@ -925,74 +1020,60 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     cfg = load_config()
     proj = find_project(cfg, project)
 
-    if proj.status not in ("needs-plan", "ready"):
+    if proj.derived_status not in ("needs-plan", "planned"):
         console.print(
-            f"[yellow]Warning: project status is '{proj.status}', not 'needs-plan'[/yellow]"
+            f"[yellow]Warning: project status is '{proj.derived_status}', not 'needs-plan'[/yellow]"
         )
         if not typer.confirm("Continue anyway?"):
             raise typer.Exit(0)
 
-    note_content = proj.path.read_text() if proj.path else ""
+    # Plans go in the project folder
+    today = datetime.now().strftime("%Y-%m-%d")
+    plan_path = proj.folder / f"plan-{today}.md" if proj.folder else cfg.projects_dir / f"{proj.slug}-plan.md"
+    notes_path = project_notes_path(proj) if proj.folder else None
 
-    # For folder-per-project, plans go in the project folder
-    if proj.is_folder:
-        plans_dir = proj.folder
-        today = datetime.now().strftime("%Y-%m-%d")
-        plan_name = f"plan-{today}"
-        plan_path = plans_dir / f"{plan_name}.md"
-        stage_instructions = textwrap.dedent("""\
+    stage_instructions = textwrap.dedent("""\
 
-        If this project has multiple stages/phases, define them in the project
-        frontmatter and create a separate plan file for each stage:
+    If this project has multiple stages/phases, define them in the project
+    frontmatter:
 
-        In index.md frontmatter, add:
-        stages:
-          - id: 1
-            name: Stage name
-            status: pending
-            plan: stage-1-name.md
-            depends_on: []
-          - id: 2
-            name: Another stage
-            status: pending
-            plan: stage-2-name.md
-            depends_on: [1]
+    stages:
+      - id: 1
+        name: Stage name
+        status: pending
+        depends_on: []
+      - id: 2
+        name: Another stage
+        status: pending
+        depends_on: [1]
 
-        Write each stage plan as a file in the project folder.
-        """)
-    else:
-        plans_dir = cfg.projects_dir / "plans"
-        today = datetime.now().strftime("%Y-%m-%d")
-        plan_name = f"{proj.slug}-plan-{today}"
-        plan_path = plans_dir / f"{plan_name}.md"
-        stage_instructions = ""
+    For each stage, write the plan to:
+      {project_folder}/stages/{id}-{slugified-name}/plan.md
+    Create these folders if they don't exist.
+    """)
 
     system_prompt = textwrap.dedent(f"""\
         You are planning the project: {proj.title}
 
         Your job is to:
-        1. Understand the problem described in the project note
+        1. Read the project note at {proj.path}
         2. Search the codebase and Obsidian vault for relevant context
         3. Discuss the approach with the user
         4. Write a detailed implementation plan with tasks
         {stage_instructions}
         When done:
 
-        1. Write the detailed plan as a separate note at:
-           {plan_path}
-           This is an Obsidian vault, so the plan will be viewable and clickable.
-           Include the full plan with context, architecture decisions, and rationale.
+        1. Write the detailed plan to: {plan_path}
+           For staged projects, also write per-stage plans to stages/<id>-<name>/plan.md
 
-        2. Update the project note at:
-           {proj.path}
-           - Fill in the Objective, Tasks (as checkboxes), and Spec sections
-           - Add the Obsidian wikilink "[[{plan_name}]]" to the `plans` list in frontmatter
+        2. Update the project note at {proj.path}:
+           - Fill in the Objective and Tasks sections
            - Add any relevant Obsidian note paths to the `related_notes` frontmatter field
-           - Change the status in frontmatter to 'ready'
 
-        Create the plans directory if it doesn't exist: {plans_dir}
+        Do NOT update the status in frontmatter — arc handles that.
+        Write session notes to: {notes_path or proj.path}
 
-        Phoenix repo (if sandbox exists): {proj.sandbox or cfg.sandbox_root}
+        Sandbox (if exists): {proj.sandbox or cfg.sandbox_root}
         Obsidian vault: {cfg.obsidian_vault}
     """)
 
@@ -1019,6 +1100,14 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
     set_tab_title("")
 
     append_session_note(proj, "plan", f"Planning session for {proj.title}")
+
+    # Post-command: arc owns the status transition
+    proj = find_project(cfg, project)  # reload to pick up any agent changes
+    if proj.status == "needs-plan":
+        proj.status = "planned"
+    if proj.stages:
+        auto_promote_ready(proj)
+        ensure_stage_folders(proj)
     update_project_note(proj)
 
 
@@ -1044,15 +1133,23 @@ def stage_cmd(
             id=next_id,
             name=add,
             status="pending",
-            plan=f"stage-{next_id}-{slugify(add)}.md",
             depends_on=deps,
         )
         proj.stages.append(new_stage)
         update_project_note(proj)
+        # Create stage folder with plan.md and notes.md
+        if proj.folder:
+            sf = stage_folder(proj, new_stage)
+            sf.mkdir(parents=True, exist_ok=True)
+            for fname in ("plan.md", "notes.md"):
+                fpath = sf / fname
+                if not fpath.exists():
+                    fpath.write_text("")
         console.print(f"[green]Added stage {next_id}: {add}[/green]")
         if deps:
             console.print(f"  Depends on: {', '.join(str(d) for d in deps)}")
-        console.print(f"  Plan file: {new_stage.plan}")
+        if proj.folder:
+            console.print(f"  Folder: stages/{new_stage.folder_name()}/")
         return
 
     if plan_stage is not None:
@@ -1066,7 +1163,8 @@ def stage_cmd(
             )
             raise typer.Exit(1)
 
-        plan_path = proj.folder / s.plan
+        plan_path = stage_plan_path(proj, s)
+        notes_path = stage_notes_path(proj, s)
         system_prompt = textwrap.dedent(f"""\
             You are planning stage {s.id} of project: {proj.title}
 
@@ -1081,8 +1179,11 @@ def stage_cmd(
             - Expected outputs
             - Done criteria
 
+            Write any session notes to: {notes_path}
+            Do NOT update status in frontmatter — arc handles that.
+
             Project note: {proj.path}
-            Phoenix repo (if sandbox exists): {proj.sandbox or cfg.sandbox_root}
+            Sandbox (if exists): {proj.sandbox or cfg.sandbox_root}
             Obsidian vault: {cfg.obsidian_vault}
         """)
 
@@ -1110,40 +1211,48 @@ def stage_cmd(
         console.print(f'Add with: [bold]arc stage {proj.slug} --add "Stage name"[/bold]')
         return
 
-    done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
+    active_sessions = tmux_sessions()
 
     table = Table(show_header=True, header_style="bold", padding=(0, 2))
     table.add_column("#", justify="right")
     table.add_column("Stage")
     table.add_column("Status")
+    table.add_column("PR", no_wrap=True)
     table.add_column("Depends")
+    table.add_column("Sessions", no_wrap=True)
 
     for s in sorted(proj.stages, key=lambda x: x.id):
-        unmet = [d for d in s.depends_on if d not in done_ids]
-        blocked = len(unmet) > 0 and s.status == "pending"
+        color = STAGE_STATUS_COLORS.get(s.status, "white")
+        status_str = f"[{color}]{s.status}[/{color}]"
 
-        if blocked:
-            status_str = "[red]blocked[/red]"
-        elif s.status == "done":
-            status_str = "[green]done[/green]"
-        elif s.status == "running":
-            status_str = "[yellow]running[/yellow]"
-        elif s.status == "skipped":
-            status_str = "[dim]skipped[/dim]"
-        else:
-            status_str = "pending"
+        # PR display
+        pr_display = "[dim]—[/dim]"
+        if s.github_prs:
+            pr_url = s.github_prs[-1]
+            pr_match = re.search(r"/pull/(\d+)", pr_url)
+            if pr_match:
+                pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
 
         deps_str = ", ".join(str(d) for d in s.depends_on) if s.depends_on else "—"
-        table.add_row(str(s.id), s.name, status_str, deps_str)
 
+        # Sessions for this stage
+        stage_sessions = [
+            sess for sess in active_sessions
+            if sess.startswith(f"arc-{proj.slug}")
+        ]
+        sess_str = "[dim]—[/dim]"
+        if stage_sessions:
+            parts = []
+            for sess in stage_sessions:
+                suffix = sess[len(f"arc-{proj.slug}"):]
+                label = suffix.lstrip("-") if suffix else "impl"
+                parts.append(f"[green]{label}[/green]")
+            sess_str = " ".join(parts)
+
+        table.add_row(str(s.id), s.name, status_str, pr_display, deps_str, sess_str)
+
+    console.print(f"\n[bold]{proj.title}[/bold] — {proj.stage_progress()} stages done\n")
     console.print(table)
-
-    # Print blocking info
-    for s in sorted(proj.stages, key=lambda x: x.id):
-        unmet = [d for d in s.depends_on if d not in done_ids]
-        if unmet and s.status == "pending":
-            blocking_names = ", ".join(str(d) for d in unmet)
-            console.print(f"  [dim]↳ {s.name} waiting on: {blocking_names}[/dim]")
 
 
 @app.command(rich_help_panel="Development")
@@ -1261,26 +1370,21 @@ def _run_review(
         tool_label += f" ({model})"
     console.print(f"[bold cyan]Starting code review with {tool_label}...[/bold cyan]")
 
-    proj.status = "reviewing"
-    update_project_note(proj)
-
-    # Gather project documentation
-    note_content = proj.path.read_text() if proj.path and proj.path.exists() else ""
-
-    # Gather all stage plans if staged project
+    # Gather stage plans context
     plans_context = ""
     if proj.stages and proj.folder:
         for s in proj.stages:
-            if s.plan:
-                plan_path = proj.folder / s.plan
-                if plan_path.exists():
-                    plans_context += f"\n### Stage {s.id}: {s.name}\n{plan_path.read_text()}\n"
+            plan_path = stage_plan_path(proj, s)
+            if plan_path.exists() and plan_path.stat().st_size > 0:
+                plans_context += f"\n### Stage {s.id}: {s.name}\n{plan_path.read_text()}\n"
+
+    # Determine notes path
+    notes_path = project_notes_path(proj) if proj.folder else proj.path
 
     review_prompt = textwrap.dedent(f"""\
         You are reviewing an implementation for project: {proj.title}
 
-        ## Project Documentation
-        {note_content}
+        Read the project note at: {proj.path}
 
         {f"## Stage Context{chr(10)}{stage_context}" if stage_context else ""}
 
@@ -1294,9 +1398,10 @@ def _run_review(
         3. Look for: logic errors, missed edge cases, off-by-one bugs, incorrect API usage, poor error messages, naming issues
         4. As a secondary check, run tests (`{cfg.test_cmd}`) and lint (`{cfg.lint_cmd}`)
         5. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
-        6. When done, append a dated `### YYYY-MM-DD — Review` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing your findings and any fixes made
+        6. Write review notes to: {notes_path}
 
-        IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
+        Do NOT update status in frontmatter — arc handles that.
+        Do NOT write summary files into the codebase/sandbox.
     """)
 
     if tool == "codex":
@@ -1313,9 +1418,6 @@ def _run_review(
     subprocess.run(cmd, cwd=sandbox_path, env=_clean_env())
 
     console.print(f"[green]{tool} review complete.[/green]")
-
-    proj.status = "reviewed"
-    update_project_note(proj)
 
 
 def _implement_interactive_staged(
@@ -1337,30 +1439,35 @@ def _implement_interactive_staged(
         raise typer.Exit(1)
 
     # Validate deps
-    done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
-    unmet = [d for d in stage.depends_on if d not in done_ids]
-    if unmet:
-        blocking = [f"{b.id} ({b.name})" for b in proj.stages if b.id in unmet]
-        console.print(f"[red]Stage {stage_id} blocked by: {', '.join(blocking)}[/red]")
+    if stage.status == "pending":
+        console.print(f"[red]Stage {stage_id} is pending (dependencies not met).[/red]")
         raise typer.Exit(1)
 
     if stage.status == "done":
         if not typer.confirm(f"Stage {stage_id} is done. Re-run?", default=False):
             raise typer.Exit(0)
-        stage.status = "pending"
 
-    if stage.status == "running":
-        if not typer.confirm(f"Stage {stage_id} is marked running. Re-run?", default=True):
+    if stage.status in ("implemented", "reviewed"):
+        if not typer.confirm(f"Stage {stage_id} is '{stage.status}'. Re-implement?", default=False):
             raise typer.Exit(0)
 
-    # Update stage status
-    stage.status = "running"
-    update_project_note(proj)
+    # Build context from dependent stages
+    dep_context = ""
+    if proj.folder:
+        for dep_id in stage.depends_on:
+            dep_stage = proj.get_stage(dep_id)
+            if dep_stage:
+                for path_fn, label in [(stage_plan_path, "Plan"), (stage_notes_path, "Notes")]:
+                    p = path_fn(proj, dep_stage)
+                    if p.exists() and p.stat().st_size > 0:
+                        dep_context += f"\n### Stage {dep_stage.id} ({dep_stage.name}) — {label}\n{p.read_text()}\n"
 
-    # Build system prompt from stage plan
+    # Current stage plan
     plan_content = ""
-    if stage.plan and proj.folder:
-        plan_path = proj.folder / stage.plan
+    notes_path = ""
+    if proj.folder:
+        plan_path = stage_plan_path(proj, stage)
+        notes_path = str(stage_notes_path(proj, stage))
         if plan_path.exists():
             plan_content = plan_path.read_text()
 
@@ -1369,13 +1476,20 @@ def _implement_interactive_staged(
 
         Stage: {stage.name}
 
+        ## Plan
         {plan_content if plan_content else "No plan file found. Ask the user what to do."}
+
+        {"## Prior Stages" + dep_context if dep_context else ""}
 
         Project sandbox: {sandbox_path}
         Branch: {proj.branch}
 
         ## Git
         Use git to track your changes. After every meaningful change, stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
+
+        ## Notes
+        Write session notes to: {notes_path}
+        Do NOT update status in frontmatter — arc handles that.
 
         When you've completed all steps, tell the user.
     """)
@@ -1393,58 +1507,24 @@ def _implement_interactive_staged(
     )
     set_tab_title("")
 
-    append_session_note(proj, "implement", f"Stage {stage.id} ({stage.name}) implementation completed")
+    # Post-command: arc owns the status transition
+    append_session_note(proj, "implement", f"Stage {stage.id} ({stage.name}) implementation completed", stage=stage)
+    stage.status = "implemented"
+    auto_promote_ready(proj)
+    update_project_note(proj)
 
-    # Post-exit prompt
-    console.print()
-    choice = input(f"Mark '{stage.name}' as done? [Y/n/skip] ").strip().lower()
-
-    if choice in ("", "y", "yes"):
-        stage.status = "done"
-        update_project_note(proj)
-        console.print(f"[green]Stage {stage.id} marked done.[/green]")
-
-        done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
-        newly_unblocked = [
-            s
-            for s in proj.stages
-            if s.status == "pending" and all(d in done_ids for d in s.depends_on)
-        ]
-        if newly_unblocked:
-            names = [f"{s.id} ({s.name})" for s in newly_unblocked]
-            console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
-            notify(
-                "arc", f"{stage.name} done. Unblocked: {', '.join(s.name for s in newly_unblocked)}"
-            )
-        else:
-            console.print("[dim]No new stages unblocked.[/dim]")
-
-        if all(s.status in ("done", "skipped") for s in proj.stages):
-            proj.status = "reviewed"
-            update_project_note(proj)
-            console.print(
-                f"[green bold]All stages complete! Review changes, then: arc approve {proj.slug}[/green bold]"
-            )
-            notify("arc", f"AI review complete for {proj.slug} — ready for your review")
-
-    elif choice == "skip":
-        stage.status = "skipped"
-        update_project_note(proj)
-        console.print(f"[yellow]Stage {stage.id} skipped.[/yellow]")
-    else:
-        console.print(
-            f"[dim]Stage {stage.id} still running. Resume with: arc implement {proj.slug} {stage.id}[/dim]"
-        )
+    console.print(f"[green]Stage {stage.id} marked implemented.[/green]")
+    console.print(f"  Review: [bold]arc review {proj.slug}[/bold]")
 
 
 def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path) -> None:
     """Interactive implementation for non-staged projects."""
-    note_content = proj.path.read_text() if proj.path else ""
+    notes_path = project_notes_path(proj) if proj.folder else None
 
     system_prompt = textwrap.dedent(f"""\
         You are working on project: {proj.title}
 
-        {note_content}
+        Read the project note at: {proj.path}
 
         Project sandbox: {sandbox_path}
         Branch: {proj.branch}
@@ -1452,11 +1532,12 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
         ## Git
         Use git to track your changes. After every meaningful change, stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
 
+        ## Notes
+        Write session notes to: {notes_path or proj.path}
+        Do NOT update status in frontmatter — arc handles that.
+
         When you've completed all tasks, tell the user.
     """)
-
-    proj.status = "implementing"
-    update_project_note(proj)
 
     console.print(f"[bold]Implementing: {proj.title}[/bold]")
     console.print(f"[dim]Sandbox: {sandbox_path}[/dim]\n")
@@ -1486,7 +1567,7 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
 
 def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
     """Autonomous implementation in tmux background."""
-    note_content = proj.path.read_text() if proj.path else ""
+    notes_path = project_notes_path(proj) if proj.folder else proj.path
 
     claude_md = textwrap.dedent(f"""\
         # Project: {proj.title}
@@ -1500,16 +1581,15 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         4. Run lint: `{cfg.lint_cmd}`
         5. Fix any failures
         6. Commit your work after every meaningful change: stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
-        7. When fully done, append a dated `### YYYY-MM-DD` entry under the `## Notes` section of the Obsidian project note at `{proj.path}` summarizing what you implemented, key decisions, and any issues encountered
+        7. When done, write session notes to: {notes_path}
 
-        IMPORTANT: Do NOT write summary files, notes, review docs, or any non-code artifacts into the codebase/sandbox. All observations, learnings, and work summaries belong in the Obsidian project note above — never in the repo.
+        Do NOT update status in frontmatter — arc handles that.
+        Do NOT write summary files into the codebase/sandbox.
 
         ## Project Note
-        {note_content}
+        Read the project note at: {proj.path}
     """)
     (sandbox_path / "CLAUDE.md").write_text(claude_md)
-
-    project_note_path = str(proj.path) if proj.path else ""
 
     # Build export lines for model API keys
     env_exports = ""
@@ -1525,7 +1605,7 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         cd "{sandbox_path}"
         export ARC_PROJECT_SLUG="{proj.slug}"
 
-        # Model API keys from phoenix .env
+        # Model API keys
         {env_exports}
         # Strip conda/virtualenv env vars to avoid package resolution issues
         unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_SHLVL CONDA_EXE
@@ -1534,38 +1614,7 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
 
         echo "=== arc: Starting implementation (Claude) for {proj.slug} ==="
 
-        python3 -c "
-import re, yaml
-from pathlib import Path
-p = Path('{project_note_path}')
-text = p.read_text()
-text = re.sub(r'status: \\w[\\w-]*', 'status: implementing', text, count=1)
-p.write_text(text)
-"
-
-        {CLAUDE_BIN} --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Track your changes with git: after every meaningful change, stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Before finishing, commit any remaining modified files. When done, append a dated Notes entry to the Obsidian project note (path is in CLAUDE.md). NEVER write summary/notes/review files into the codebase."
-
-        python3 -c "
-import re
-from datetime import datetime
-from pathlib import Path
-p = Path('{project_note_path}')
-text = p.read_text()
-today = datetime.now().strftime('%Y-%m-%d')
-entry = '- **implement**: Background implementation completed for {proj.title}'
-notes_match = re.search(r'^## Notes\\s*$', text, re.MULTILINE)
-if notes_match:
-    import re as _re
-    today_pat = _re.compile(r'^### ' + _re.escape(today) + r'\\s*$', _re.MULTILINE)
-    tm = today_pat.search(text, notes_match.end())
-    if tm:
-        next_h = _re.search(r'^##', text[tm.end():], _re.MULTILINE)
-        pos = tm.end() + next_h.start() if next_h else len(text)
-        text = text[:pos].rstrip() + '\\n' + entry + '\\n' + text[pos:]
-    else:
-        text = text[:notes_match.end()] + '\\n### ' + today + '\\n' + entry + '\\n' + text[notes_match.end():]
-    p.write_text(text)
-"
+        {CLAUDE_BIN} --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Track your changes with git: after every meaningful change, stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Before finishing, commit any remaining modified files. Write session notes to {notes_path}. NEVER write summary/notes/review files into the codebase."
 
         osascript -e 'display notification "Implementation complete for {proj.slug}. Run: arc review {proj.slug}" with title "arc: {proj.slug}"'
         echo -e "\\a"
@@ -1587,7 +1636,6 @@ if notes_match:
         check=True,
     )
 
-    proj.status = "implementing"
     update_project_note(proj)
 
     console.print(f"[green]Pipeline launched in tmux session: {sess_name}[/green]")
@@ -1628,28 +1676,12 @@ def approve(
                     f"{approving_stage.name}[/dim]"
                 )
 
-    _pr_active = ("pr-open", "ci-checking", "ci-failing", "ci-passing", "pr-approved")
     if approving_stage:
-        # For stage-level approval, allow project to be "implementing"
-        if proj.status in _pr_active:
-            console.print(f"[yellow]PR already open for {proj.slug} ({proj.status})[/yellow]")
-            if proj.github_prs:
-                console.print(f"  {proj.github_prs[-1]}")
+        if approving_stage.status == "pr-open":
+            console.print(f"[yellow]Stage {approving_stage.id} already has a PR open[/yellow]")
+            if approving_stage.github_prs:
+                console.print(f"  {approving_stage.github_prs[-1]}")
             raise typer.Exit(0)
-    else:
-        if proj.status not in ("reviewed", "awaiting-approval"):
-            if proj.status in _pr_active:
-                console.print(f"[yellow]PR already open for {proj.slug} ({proj.status})[/yellow]")
-                if proj.github_prs:
-                    console.print(f"  {proj.github_prs[-1]}")
-                raise typer.Exit(0)
-            console.print(
-                f"[red]Project status is '{proj.status}', expected 'reviewed' or 'awaiting-approval'[/red]"
-            )
-            raise typer.Exit(1)
-
-    proj.status = "awaiting-approval"
-    update_project_note(proj)
 
     sandbox_path = Path(proj.sandbox)
     if not sandbox_path.exists():
@@ -1782,14 +1814,25 @@ def approve(
     pr_url = result.stdout.strip()
     console.print(f"[green]PR created: {pr_url}[/green]")
 
-    proj.status = "ci-checking"
+    # Track PR on the stage (if staged) and on the project
+    if approving_stage:
+        approving_stage.status = "pr-open"
+        approving_stage.github_prs.append(pr_url)
     proj.github_prs.append(pr_url)
     update_project_note(proj)
 
     sess_name = f"arc-{proj.slug}-ci"
     project_note_path = str(proj.path) if proj.path else ""
 
-    # Build the merge handler based on whether this is a stage-level approval
+    # Determine notes file for CI events
+    if approving_stage and proj.folder:
+        ci_notes_file = str(stage_notes_path(proj, approving_stage))
+    elif proj.folder:
+        ci_notes_file = str(project_notes_path(proj))
+    else:
+        ci_notes_file = ""
+
+    # Build the merge handler
     if approving_stage:
         merge_handler = f'''
                 echo "=== arc: PR merged! ==="
@@ -1802,24 +1845,26 @@ m = re.match(r'^---\\n(.+?)\\n---', text, re.DOTALL)
 if m:
     fm = yaml.safe_load(m.group(1))
     body = text[m.end():]
-    # Mark this stage done
     for s in fm.get('stages', []):
         if s['id'] == {approving_stage.id}:
             s['status'] = 'done'
-    # Activate next pending stage whose deps are met
+    # Auto-promote: pending stages with met deps become ready
     done_ids = {{s['id'] for s in fm.get('stages', []) if s['status'] in ('done', 'skipped')}}
     for s in sorted(fm.get('stages', []), key=lambda x: x['id']):
         if s['status'] == 'pending' and all(d in done_ids for d in s.get('depends_on', [])):
-            s['status'] = 'running'
-            break
+            s['status'] = 'ready'
     # Derive project status
-    if all(s['status'] in ('done', 'skipped') for s in fm.get('stages', [])):
-        fm['status'] = 'archived'
+    statuses = {{s['status'] for s in fm.get('stages', [])}}
+    if all(st in ('done', 'skipped') for st in statuses):
+        fm['status'] = 'done'
+    elif statuses - {{'pending', 'ready', 'done', 'skipped'}}:
+        fm['status'] = 'active'
     else:
-        fm['status'] = 'implementing'
+        fm['status'] = 'planned'
     new_fm = yaml.dump(fm, default_flow_style=False, sort_keys=False)
     p.write_text('---\\n' + new_fm + '---\\n' + body)
 "
+                [ -n "{ci_notes_file}" ] && echo "- **ci**: PR merged" >> "{ci_notes_file}"
                 osascript -e 'display notification "Stage {approving_stage.id} merged!" with title "arc: {proj.slug}"'
                 break'''
     else:
@@ -1831,11 +1876,12 @@ import re
 from pathlib import Path
 p = Path('{project_note_path}')
 text = p.read_text()
-text = re.sub(r'status: \\w[\\w-]*', 'status: archived', text, count=1)
+text = re.sub(r'status: \\w[\\w-]*', 'status: done', text, count=1)
 text = re.sub(r'\\ndev_port:.*', '', text)
 text = re.sub(r'\\ndev_session:.*', '', text)
 p.write_text(text)
 "
+                [ -n "{ci_notes_file}" ] && echo "- **ci**: PR merged" >> "{ci_notes_file}"
                 osascript -e 'display notification "PR merged!" with title "arc: {proj.slug}"'
                 break'''
 
@@ -1845,15 +1891,8 @@ p.write_text(text)
 
         echo "=== arc: Monitoring CI for {proj.slug} ==="
 
-        set_status() {{
-            python3 -c "
-import re
-from pathlib import Path
-p = Path('{project_note_path}')
-text = p.read_text()
-text = re.sub(r'status: \\w[\\w-]*', 'status: $1', text, count=1)
-p.write_text(text)
-"
+        append_note() {{
+            [ -n "{ci_notes_file}" ] && echo "- **ci**: $1" >> "{ci_notes_file}"
         }}
 
         prev_status=""
@@ -1886,13 +1925,13 @@ p.write_text(text)
             # Only update + notify on status change
             if [ "$new_status" != "$prev_status" ]; then
                 echo "=== arc: status -> $new_status ==="
-                set_status "$new_status"
+                append_note "$new_status"
 
                 case "$new_status" in
                     ci-failing)
                         osascript -e 'display notification "CI failing — launching fix agent" with title "arc: {proj.slug}"'
                         {CLAUDE_BIN} --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Push."
-                        # After fix attempt, reset so next loop re-evaluates
+                        append_note "Auto-fix pushed"
                         prev_status=""
                         continue
                         ;;
@@ -1941,9 +1980,12 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
     note_path = proj.path
     sandbox_info = f"Sandbox path: {proj.sandbox}" if proj.sandbox else "No sandbox configured."
 
+    notes_path = project_notes_path(proj) if proj.folder else note_path
+
     system_prompt = textwrap.dedent(f"""\
         Project: {proj.title}
         Project note: {note_path}
+        Session notes: {notes_path}
         {sandbox_info}
         Obsidian vault: {cfg.obsidian_vault}
 
@@ -2000,6 +2042,18 @@ def review(
     set_tab_title(f"arc: {project} (review)")
     _run_review(cfg, proj, sandbox_path, tool=tool, model=model)
     set_tab_title("")
+
+    # Post-command: mark the first 'implemented' stage as 'reviewed'
+    proj = find_project(cfg, project)  # reload
+    if proj.stages:
+        for s in proj.stages:
+            if s.status == "implemented":
+                s.status = "reviewed"
+                append_session_note(proj, "review", f"Code review completed for stage {s.id} ({s.name})", stage=s)
+                break
+    else:
+        append_session_note(proj, "review", f"Code review completed for {proj.title}")
+    update_project_note(proj)
 
 
 @app.command(rich_help_panel="Development")
@@ -2274,11 +2328,11 @@ def done(
 
     if proj.stages:
         if stage_id is None:
-            stage = next((s for s in proj.stages if s.status == "running"), None)
+            # Find first non-done/skipped stage
+            active = [s for s in proj.stages if s.status not in ("done", "skipped", "pending")]
+            stage = active[0] if active else proj.next_available_stage()
             if stage is None:
-                stage = proj.next_available_stage()
-            if stage is None:
-                console.print("[yellow]No pending/running stages.[/yellow]")
+                console.print("[yellow]No active stages to mark done.[/yellow]")
                 raise typer.Exit(0)
         else:
             stage = proj.get_stage(stage_id)
@@ -2288,34 +2342,30 @@ def done(
 
         new_status = "skipped" if skip else "done"
         stage.status = new_status
+        auto_promote_ready(proj)
         update_project_note(proj)
         console.print(f"[green]Stage {stage.id} ({stage.name}) marked {new_status}.[/green]")
 
-        if not skip:
-            done_ids = {s.id for s in proj.stages if s.status in ("done", "skipped")}
-            newly_unblocked = [
-                s
-                for s in proj.stages
-                if s.status == "pending" and all(d in done_ids for d in s.depends_on)
-            ]
-            if newly_unblocked:
-                names = [f"{s.id} ({s.name})" for s in newly_unblocked]
-                console.print(f"[green]Now unblocked: {', '.join(names)}[/green]")
+        # Show newly ready stages
+        newly_ready = [s for s in proj.stages if s.status == "ready"]
+        if newly_ready and not skip:
+            names = [f"{s.id} ({s.name})" for s in newly_ready]
+            console.print(f"[green]Now ready: {', '.join(names)}[/green]")
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
             _kill_sessions(proj)
-            proj.status = "archived"
+            proj.status = "done"
             proj.dev_port = 0
             proj.dev_session = ""
             update_project_note(proj)
-            console.print(f"[green bold]All stages complete — {proj.slug} archived.[/green bold]")
+            console.print(f"[green bold]All stages complete — {proj.slug} done.[/green bold]")
     else:
         _kill_sessions(proj)
-        proj.status = "archived"
+        proj.status = "done"
         proj.dev_port = 0
         proj.dev_session = ""
         update_project_note(proj)
-        console.print(f"[green]{proj.slug} archived.[/green]")
+        console.print(f"[green]{proj.slug} done.[/green]")
 
 
 @app.command(rich_help_panel="Project Management")

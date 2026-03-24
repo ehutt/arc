@@ -107,7 +107,30 @@ arc approve <slug>    # Push, open PR, monitor CI
 | `arc chat <slug>` | Informal Claude chat with project context |
 | `arc organize` | Run the vault organizer (tag & link notes) |
 
-Status progresses automatically: `needs-plan` → `ready` → `implementing` → `reviewing` → `awaiting-approval` → `pr-open` → `archived`
+### Status lifecycle
+
+**Project statuses** (derived from stages): `needs-plan` → `planned` → `active` → `done` → `archived`
+
+**Stage statuses**: `pending` → `ready` → `implemented` → `reviewed` → `pr-open` → `done`
+
+Stages auto-promote from `pending` to `ready` when their dependencies are met. Arc owns all status transitions — agents don't update frontmatter.
+
+### Project folder structure
+
+```
+Projects/my-feature/
+  index.md              # frontmatter + objective + tasks (lean)
+  notes.md              # project-level session log
+  stages/
+    1-api-endpoints/
+      plan.md           # stage plan
+      notes.md          # stage session log
+    2-ui-components/
+      plan.md
+      notes.md
+```
+
+Session notes, plans, and CI events all go to the appropriate `notes.md` — never into `index.md`. Each stage gets its own folder with isolated context.
 
 ## Configuration
 
@@ -290,8 +313,8 @@ These are optional — arc works without them. They just make it easier to track
 ### Data model
 
 - **`Config`** — parsed from `config.toml`: vault path, sandbox root, GitHub repo, branch prefix, test/lint commands
-- **`Project`** — parsed from `{vault}/Projects/{slug}/index.md` frontmatter: slug, title, status, branch, sandbox path, stages, linked issues/PRs
-- **`Stage`** — subtask with dependency graph: id, name, status (pending/running/done/skipped), plan file, depends_on list
+- **`Project`** — parsed from `{vault}/Projects/{slug}/index.md` frontmatter: slug, title, status, branch, sandbox path, stages, linked issues/PRs. Project status is derived from stage statuses.
+- **`Stage`** — subtask with dependency graph: id, name, status, depends_on, github_issues, github_prs. Each stage gets a folder under `stages/` with `plan.md` and `notes.md`.
 
 ### tmux sessions
 
