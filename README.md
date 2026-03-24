@@ -4,20 +4,17 @@ A CLI for tracking the arc of AI-assisted projects end-to-end. Each project live
 
 ## Why
 
-I built arc for myself. I'm an AI engineer at [Arize AI](https://arize.com), where I split my time between building [Phoenix](https://github.com/Arize-ai/phoenix) (our open-source LLM observability platform) and creating educational content — courses, talks, blog posts, benchmarks. I'm often juggling 5-10 projects at once across both tracks, and I needed a tool that could keep up.
+When you're working on multiple projects in parallel, context gets scattered — across GitHub issues, Obsidian notes, web clippings, and your codebase. You lose track of what's running where, which branch is which, and the current stage of ongoing projects.
 
-arc is opinionated. It reflects my specific workflow: Obsidian for knowledge management, Claude for implementation, Codex for code review, tmux for session management, GitHub for PRs. It bakes in the development patterns and review preferences I've landed on after months of working this way.
+arc is opinionated. It bakes in the development patterns and preferences I've landed on after months of working with agents. I built it to solve some very specific problems in my workflow, some of which may or may not be relevant to you. That said, the problems it solves are general. If you're feeling the friction of context switching, parallel development, tracking project status, and documenting agent sessions across long-running AI-assisted projects, then arc might be useful to you as-is. Or at least as a starting point for building your own version. The [customization guide](#customization-guide) is written specifically to help your coding agent of preference adapt arc to your repo, your tools, and your workflow.
 
-That said, the problems it solves are general. If you're managing multiple AI-assisted projects and feeling the friction of context switching, scattered state, and manual bookkeeping, arc might be useful to you as-is — or as a starting point for building your own version. The [customization guide](#customization-guide) is written specifically to help a coding agent adapt arc to your repo, your tools, and your workflow.
-
-When you're working on multiple features in parallel, context gets scattered — across GitHub issues, Obsidian notes, web clippings, and your git repo. You lose track of what's running where, which branch is which, and the current stage of ongoing projects.
 
 The specific problems arc solves:
 
-- **Context management**: Pulls together GitHub issues, Obsidian notes, and repo state into a single project view. Plans, clippings, and related notes are automatically linked and fed to agents as context.
-- **Parallel development**: Each project gets its own isolated git clone (not a worktree — a full clone), its own feature branch, and optionally its own dev server, all sharing a common local database. No stepping on your own toes.
+- **Context management**: Pulls together GitHub issues, Obsidian notes, and repo state into a single project view. Plans, clippings, and related notes are automatically linked and fed to agents as progressively disclosed context.
+- **Parallel development**: Each project gets its own isolated git clone (not a worktree — a full clone), its own feature branch, and optionally its own dev server, all sharing a common local database (my personal preference, ymmv). 
 - **At-a-glance status**: The dashboard shows all active projects — development and non-development — with their current stage, branch, PR status, and running tmux sessions.
-- **Automate the predictable parts**: Code review, CI monitoring, branch management, and PR creation are tedious but mechanical. arc handles them so you can focus on the interesting decisions.
+- **Automate the predictable parts**: Code review, CI monitoring, branch management, and PR creation are tedious but mechanical. arc handles them so you can focus on more interesting things without dropping the ball. 
 
 ## Workflow
 
@@ -30,6 +27,14 @@ The specific problems arc solves:
 6. arc approve            →  Push, open PR, continuous CI monitor with auto-fix
 7. arc done / arc archive →  Mark complete, clean up sessions
 ```
+
+At any point during a project's lifecycle, you can drop in for human-in-the-loop work:
+
+- **`arc chat <slug>`** — start a Claude conversation with full project context loaded. Good for brainstorming, asking questions about the codebase, or thinking through a tricky decision without launching a full implementation session.
+- **`arc note <slug>`** — jump straight to the project's Obsidian note. Review plans, check session history, or update the objective.
+- **`arc editor <slug>`** — open the project sandbox in VS Code (or Cursor with `--cursor`) with the changed files pre-loaded, so you can review a diff or make a quick manual edit.
+
+These aren't part of the linear workflow — they're escape hatches for when you want to check in, steer, or just read what's happened.
 
 ## Highlights
 
