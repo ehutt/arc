@@ -89,13 +89,13 @@ arc approve <slug>    # Push, open PR, monitor CI
 | `arc sync` | Pull GitHub issues and sync PR status from the configured repo |
 | `arc note <slug>` | Open a project's Obsidian note |
 | `arc new <title>` | Create a new project note without a GitHub issue |
-| `arc done <slug> [stage]` | Mark a stage (or whole project) as done — advances to next stage, archives when all stages complete. Kills sessions and cleans up. |
+| `arc done <slug> [stage]` | Mark a stage (or whole project) as done — auto-promotes next stages to `ready`. Use `--skip` to skip instead. |
 | `arc archive <slug>` | Shelve a project without completing it — kills sessions but preserves the sandbox for later. Use when pausing or abandoning work. |
 | **Planning** | |
 | `arc plan <slug>` | Interactive Claude session to plan a project |
-| `arc stage <slug>` | Manage stages for a project |
+| `arc stage <slug>` | List stages; `--add "name"` to add, `--depends-on 1,2` for deps, `--plan <id>` to plan a stage |
 | **Development** | |
-| `arc sandbox <slug>` | Create an isolated git clone (worktree) with a feature branch |
+| `arc sandbox <slug>` | Create an isolated git clone with a feature branch |
 | `arc implement <slug>` | Claude implementation; add `--bg` for autonomous mode in tmux |
 | `arc editor <slug>` | Open sandbox in VS Code (or Cursor with `--cursor`) with changed files |
 | `arc dev <slug>` | Launch dev server in a background tmux session |
@@ -131,6 +131,8 @@ Projects/my-feature/
 ```
 
 Session notes, plans, and CI events all go to the appropriate `notes.md` — never into `index.md`. Each stage gets its own folder with isolated context.
+
+Existing projects are auto-migrated on load: `## Notes` sections are extracted from `index.md` into `notes.md`, old statuses are mapped to the new system, and stage folders are created.
 
 ## Configuration
 
@@ -181,8 +183,8 @@ This section is written for a coding agent helping a new user set up arc for the
 
 1. **`config.toml`**: Set `github.repo` to the target repo (e.g. `"my-org/my-app"`) and `github.user` to the user's GitHub username.
 2. **`config.toml`**: Set `sandbox_root` to wherever clones should live (e.g. `"~/Projects/my-app-clones"`).
-3. **`arc.py` line ~147**: The `bare_repo` property returns `self.sandbox_root / ".phoenix-bare"`. Rename `.phoenix-bare` to something appropriate (e.g. `".my-app-bare"`). This is a local bare git reference used for fast `git clone --reference`.
-4. **`arc.py` `_load_env_keys()`** (line ~2083): This function loads API keys from a `.env` file at `cfg.sandbox_root.parent / "phoenix" / ".env"`. Change `"phoenix"` to the directory name of your main repo checkout, or remove this function if you manage env vars differently.
+3. **`arc.py`** `Config.bare_repo` property: Returns `self.sandbox_root / ".phoenix-bare"`. Rename `.phoenix-bare` to something appropriate (e.g. `".my-app-bare"`). This is a local bare git reference used for fast `git clone --reference`.
+4. **`arc.py`** `_load_env_keys()` function: Loads API keys from a `.env` file at `cfg.sandbox_root.parent / "phoenix" / ".env"`. Change `"phoenix"` to the directory name of your main repo checkout, or remove this function if you manage env vars differently.
 
 ### Customizing the dev server command
 
@@ -217,19 +219,17 @@ To change the default, edit `DEFAULT_REVIEW_TOOL` and `DEFAULT_REVIEW_MODEL` nea
 
 ### System prompts injected by arc
 
-arc injects system prompts into Claude and Codex at several points. You can customize these to match your team's conventions, coding standards, or review criteria. Each prompt includes project context (title, note content, plan) and task-specific instructions.
+arc injects system prompts into Claude and Codex at several points. You can customize these to match your team's conventions, coding standards, or review criteria. Each prompt includes project context (title, paths to notes/plans) and task-specific instructions. Agents are told to write session notes to the appropriate `notes.md` and are explicitly told *not* to update status in frontmatter.
 
 | Command | Where in `arc.py` | What the prompt does |
 |---|---|---|
-| `arc plan` | `plan()` function | Instructs Claude to write a plan from the project note |
-| `arc implement` (interactive) | `_implement_interactive_simple()` and `_implement_interactive_staged()` | Gives Claude the project context, sandbox path, and git commit instructions |
-| `arc implement --bg` | `_implement_bg()` — writes a `CLAUDE.md` to the sandbox | Autonomous implementation instructions (read plan, implement, test, lint, commit) |
+| `arc plan` | `plan()` function | Instructs Claude to write a plan; points to project note and vault |
+| `arc implement` (interactive) | `_implement_interactive_simple()` and `_implement_interactive_staged()` | Gives Claude the project context, sandbox path, and git commit instructions. For staged projects, auto-includes `plan.md` and `notes.md` from all dependent stages under a "Prior Stages" section. |
+| `arc implement --bg` | `_implement_bg()` — writes a `CLAUDE.md` to the sandbox | Autonomous implementation instructions with paths to project note and notes file |
 | `arc implement --bg` | `_implement_bg()` — inline `-p` flag | One-line prompt passed to `claude` CLI in the orchestrator script |
 | `arc review` | `_run_review()` | Code quality review prompt: diff against main, check correctness, run tests/lint, fix issues |
-| `arc chat` | `chat()` function | Lightweight context prompt with project note content |
+| `arc chat` | `chat()` function | Lightweight context prompt with paths to project note and notes file |
 | `arc approve` (CI fix) | CI monitor script in `approve()` | Instructs Claude to read CI failures, fix them, and push |
-
-The background orchestrator (`arc implement --bg`) also writes a `CLAUDE.md` file into the sandbox that Claude reads on startup. This file contains the full project note and implementation instructions.
 
 ### Claude Code integration
 
