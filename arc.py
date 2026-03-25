@@ -828,7 +828,7 @@ def init():
     """Interactive setup — create config.toml from prompts."""
     config_path = Path(__file__).resolve().parent / "config.toml"
     if config_path.exists():
-        overwrite = typer.confirm(f"config.toml already exists. Overwrite?", default=False)
+        overwrite = typer.confirm("config.toml already exists. Overwrite?", default=False)
         if not overwrite:
             raise typer.Exit(0)
 
@@ -883,7 +883,7 @@ model = "{organize_model}"
     config_path.write_text(config_content)
     console.print(f"\n[green]Config written to {config_path}[/green]")
     console.print(f"  Edit anytime: [bold]{config_path}[/bold]")
-    console.print(f"  Next: [bold]arc sync[/bold] to pull issues, or [bold]arc new <title>[/bold] to start a project")
+    console.print("  Next: [bold]arc sync[/bold] to pull issues, or [bold]arc new <title>[/bold] to start a project")
 
 
 @app.command(rich_help_panel="Project Management")
@@ -1567,7 +1567,7 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
     append_session_note(proj, "implement", f"Implementation session for {proj.title}")
 
     console.print()
-    console.print(f"[green]Implementation complete.[/green]")
+    console.print("[green]Implementation complete.[/green]")
     console.print(f"  Review: [bold]arc review {proj.slug}[/bold]")
     console.print(f"  Approve: [bold]arc approve {proj.slug}[/bold]")
 
@@ -2173,6 +2173,19 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     # Point to shared local DB
     os.environ["PHOENIX_WORKING_DIR"] = str(Path.home() / ".phoenix")
 
+    # Snapshot lockfile contents before rebase (to detect dependency changes)
+    def _lockfile_digest(path: Path) -> str | None:
+        try:
+            import hashlib
+            return hashlib.md5(path.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            return None
+
+    uv_lock = sandbox_path / "uv.lock"
+    pnpm_lock = sandbox_path / "app" / "pnpm-lock.yaml"
+    pre_uv = _lockfile_digest(uv_lock)
+    pre_pnpm = _lockfile_digest(pnpm_lock)
+
     # Pull latest from main and rebase
     console.print("[dim]Pulling latest from main...[/dim]")
     subprocess.run(["git", "fetch", "origin", "main"], cwd=sandbox_path, capture_output=True)
@@ -2183,17 +2196,37 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
         text=True,
     )
     if result.returncode != 0:
-        console.print("[yellow]Rebase onto main failed — resolve conflicts manually[/yellow]")
+        subprocess.run(
+            ["git", "rebase", "--abort"], cwd=sandbox_path, capture_output=True
+        )
+        console.print("[yellow]Rebase onto main failed.[/yellow]")
         console.print(f"[dim]{result.stderr.strip()}[/dim]")
-        raise typer.Exit(1)
+        console.print("\n[bold]Options:[/bold]")
+        console.print("  [1] Continue without rebasing")
+        console.print("  [2] Abort so I can fix it")
+        choice = typer.prompt("Choice", default="1")
+        if choice != "1":
+            raise typer.Exit(1)
+        console.print("[dim]Continuing on current branch...[/dim]")
 
-    # Run setup if needed (check for .venv as proxy)
+    # Install dependencies if needed
     if not (sandbox_path / ".venv").exists():
+        # First-time setup
         console.print("[bold]Running initial setup (make setup)...[/bold]")
         result = subprocess.run(["make", "setup"], cwd=sandbox_path)
         if result.returncode != 0:
             console.print("[red]Setup failed[/red]")
             raise typer.Exit(1)
+    else:
+        # Incremental: reinstall only if lockfiles changed after rebase
+        post_uv = _lockfile_digest(uv_lock)
+        post_pnpm = _lockfile_digest(pnpm_lock)
+        if post_uv != pre_uv:
+            console.print("[dim]Python lockfile changed — running uv sync...[/dim]")
+            subprocess.run(["uv", "sync"], cwd=sandbox_path)
+        if post_pnpm != pre_pnpm:
+            console.print("[dim]Node lockfile changed — running pnpm install...[/dim]")
+            subprocess.run(["pnpm", "install"], cwd=sandbox_path / "app")
 
     # Step 1: Stale session cleanup
     if proj.dev_session and not tmux_session_exists(proj.dev_session):
