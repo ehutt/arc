@@ -789,26 +789,14 @@ def dashboard(ctx: typer.Context):
                 if m:
                     pr_display = f"[link={pr_url}]#{m.group(1)}[/link]"
 
-        # Branch — prefer active stage branch over
-        # project-level branch
-        stage_branches = [s.branch for s in p.stages if s.branch]
-        branch_display = "[dim]—[/dim]"
-        if stage_branches:
-            active_br = None
-            for s in p.stages:
-                if s.branch and s.status not in ("done", "skipped"):
-                    active_br = s.branch
-                    break
-            br = active_br or stage_branches[-1]
-            if p.sandbox and Path(p.sandbox).exists():
-                branch_display = f"[link=vscode://file/{p.sandbox}]{br}[/link]"
+        # Sandbox — clickable, opens in VS Code
+        sandbox_display = "[dim]—[/dim]"
+        if p.sandbox:
+            sandbox_name = Path(p.sandbox).name
+            if Path(p.sandbox).exists():
+                sandbox_display = f"[link=vscode://file/{p.sandbox}]{sandbox_name}[/link]"
             else:
-                branch_display = br
-        elif p.branch:
-            if p.sandbox and Path(p.sandbox).exists():
-                branch_display = f"[link=vscode://file/{p.sandbox}]{p.branch}[/link]"
-            else:
-                branch_display = p.branch
+                sandbox_display = f"[dim]{sandbox_name}[/dim]"
 
         # Sessions — compact indicators for tmux + dev
         session_parts = []
@@ -842,7 +830,7 @@ def dashboard(ctx: typer.Context):
             f"[{color}]{status_display}[/{color}]",
             p.stage_progress(),
             pr_display,
-            branch_display,
+            sandbox_display,
             session_info or "[dim]—[/dim]",
             relative_time(p.updated),
         )
