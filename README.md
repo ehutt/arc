@@ -113,6 +113,8 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 
 **Stage statuses**: `pending` → `ready` → `implemented` → `reviewed` → `pr-open` → `done`
 
+Project status is derived from stages automatically, with one exception: a project is only marked `done` via an explicit `arc done <slug>` call (not by completing all stages). All stages being done means the current plan is finished — the project stays `active` until you close it. When the last stage completes, arc prints a hint to run `arc done` when you're ready.
+
 Stages auto-promote from `pending` to `ready` when their dependencies are met. Arc owns all status transitions — agents don't update frontmatter.
 
 ### Project folder structure
@@ -311,7 +313,7 @@ These are optional — arc works without them. They just make it easier to track
 ### Data model
 
 - **`Config`** — parsed from `config.toml`: vault path, sandbox root, GitHub repo, branch prefix, test/lint commands
-- **`Project`** — parsed from `{vault}/Projects/{slug}/index.md` frontmatter: slug, title, status, branch, sandbox path, stages, linked issues/PRs. Project status is derived from stage statuses.
+- **`Project`** — parsed from `{vault}/Projects/{slug}/index.md` frontmatter: slug, title, status, branch, sandbox path, stages, linked issues/PRs. Project status is derived from stage statuses (except `done`, which requires explicit `arc done`).
 - **`Stage`** — subtask with dependency graph: id, name, status, depends_on, github_issues, github_prs. Each stage gets a folder under `stages/` with `plan.md` and `notes.md`.
 
 ### tmux sessions
