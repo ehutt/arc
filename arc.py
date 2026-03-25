@@ -228,8 +228,8 @@ class Project:
 
     @property
     def derived_status(self) -> str:
-        if self.status == "archived":
-            return "archived"
+        if self.status in ("archived", "done"):
+            return self.status
         if not self.stages:
             return self.status
         return derive_project_status(self.stages)
@@ -295,14 +295,20 @@ class Project:
 
 
 def derive_project_status(stages: list[Stage]) -> str:
-    """Derive project status from stage statuses."""
+    """Derive project status from stage statuses.
+
+    A project is only "done" when explicitly marked via `arc done <project>`.
+    All stages being complete just means the current plan is finished — the
+    project may still have future work.
+    """
     if not stages:
         return "needs-plan"
     statuses = {s.status for s in stages}
-    if all(s in ("done", "skipped") for s in statuses):
-        return "done"
-    # Anything beyond pending/ready/done/skipped means active work
+    # Any stage with active-work status → active
     if statuses - {"pending", "ready", "done", "skipped"}:
+        return "active"
+    # Some stages done → active (work has started)
+    if "done" in statuses:
         return "active"
     return "planned"
 
@@ -483,7 +489,7 @@ def update_project_note(project: Project) -> None:
     project.updated = datetime.now().strftime("%Y-%m-%d")
     if project.stages:
         auto_promote_ready(project)
-        if project.status != "archived":
+        if project.status not in ("archived", "done"):
             project.status = derive_project_status(project.stages)
     fm = yaml.dump(project.frontmatter_dict(), default_flow_style=False, sort_keys=False)
     project.path.write_text(f"---\n{fm}---\n{body}")
@@ -2333,7 +2339,13 @@ def done(
             active = [s for s in proj.stages if s.status not in ("done", "skipped", "pending")]
             stage = active[0] if active else proj.next_available_stage()
             if stage is None:
-                console.print("[yellow]No active stages to mark done.[/yellow]")
+                # All stages done — mark the project itself as done
+                _kill_sessions(proj)
+                proj.status = "done"
+                proj.dev_port = 0
+                proj.dev_session = ""
+                update_project_note(proj)
+                console.print(f"[green bold]All stages complete — {proj.slug} done.[/green bold]")
                 raise typer.Exit(0)
         else:
             stage = proj.get_stage(stage_id)
@@ -2354,12 +2366,7 @@ def done(
             console.print(f"[green]Now ready: {', '.join(names)}[/green]")
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
-            _kill_sessions(proj)
-            proj.status = "done"
-            proj.dev_port = 0
-            proj.dev_session = ""
-            update_project_note(proj)
-            console.print(f"[green bold]All stages complete — {proj.slug} done.[/green bold]")
+            console.print(f"[cyan]All stages complete. Run [bold]arc done {proj.slug}[/bold] to close the project.[/cyan]")
     else:
         _kill_sessions(proj)
         proj.status = "done"
