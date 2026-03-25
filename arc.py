@@ -32,6 +32,7 @@ from typer._completion_classes import completion_init
 
 completion_init()
 
+
 def _find_claude() -> str:
     """Locate the claude binary, checking nvm paths if not on PATH."""
     found = shutil.which("claude")
@@ -173,6 +174,7 @@ class Stage:
     depends_on: list[int] = field(default_factory=list)
     github_issues: list[str] = field(default_factory=list)
     github_prs: list[str] = field(default_factory=list)
+    branch: str = ""
 
     def folder_name(self) -> str:
         """Conventional folder name: '{id}-{slugified-name}'."""
@@ -189,6 +191,8 @@ class Stage:
             d["github_issues"] = self.github_issues
         if self.github_prs:
             d["github_prs"] = self.github_prs
+        if self.branch:
+            d["branch"] = self.branch
         return d
 
 
@@ -324,6 +328,7 @@ def auto_promote_ready(project: Project) -> None:
 
 def parse_project(path: Path) -> Project | None:
     text = path.read_text()
+
     def _safe_int(val: object, default: int = 0) -> int:
         try:
             return int(val)  # type: ignore[arg-type]
@@ -350,6 +355,7 @@ def parse_project(path: Path) -> Project | None:
                     depends_on=raw_stage.get("depends_on", []),
                     github_issues=raw_stage.get("github_issues", []),
                     github_prs=raw_stage.get("github_prs", []),
+                    branch=raw_stage.get("branch", ""),
                 )
             )
     proj = Project(
@@ -402,17 +408,19 @@ def _migrate_project(proj: Project) -> None:
         text = proj.path.read_text()
         notes_match = re.search(r"^## Notes\s*$", text, re.MULTILINE)
         if notes_match:
-            notes_content = text[notes_match.end():]
+            notes_content = text[notes_match.end() :]
             # Trim at next ## heading (if any other section follows)
             next_section = re.search(r"^## (?!Notes)", notes_content, re.MULTILINE)
             if next_section:
-                notes_content = notes_content[:next_section.start()]
+                notes_content = notes_content[: next_section.start()]
             notes_file.write_text(notes_content.strip() + "\n")
             # Remove ## Notes from index.md
             if next_section:
-                new_text = text[:notes_match.start()] + text[notes_match.end() + next_section.start():]
+                new_text = (
+                    text[: notes_match.start()] + text[notes_match.end() + next_section.start() :]
+                )
             else:
-                new_text = text[:notes_match.start()].rstrip() + "\n"
+                new_text = text[: notes_match.start()].rstrip() + "\n"
             proj.path.write_text(new_text)
 
     # Map old statuses to new ones
@@ -593,7 +601,7 @@ def _append_to_notes_file(notes_path: Path, session_type: str, summary: str) -> 
     today_pattern = re.compile(rf"^### {re.escape(today)}\s*$", re.MULTILINE)
     today_match = today_pattern.search(text)
     if today_match:
-        next_heading = re.search(r"^###", text[today_match.end():], re.MULTILINE)
+        next_heading = re.search(r"^###", text[today_match.end() :], re.MULTILINE)
         if next_heading:
             insert_pos = today_match.end() + next_heading.start()
         else:
@@ -746,7 +754,7 @@ def dashboard(ctx: typer.Context):
     table.add_column("Status", no_wrap=True)
     table.add_column("Progress", no_wrap=True)
     table.add_column("PR", no_wrap=True)
-    table.add_column("Branch", no_wrap=True, overflow="ellipsis", max_width=30)
+    table.add_column("Sandbox", no_wrap=True, overflow="ellipsis", max_width=25)
     table.add_column("Sessions", no_wrap=True)
     table.add_column("Updated", justify="right", no_wrap=True)
 
@@ -767,14 +775,36 @@ def dashboard(ctx: typer.Context):
             all_prs.extend(s.github_prs)
         pr_display = "[dim]—[/dim]"
         if all_prs:
-            pr_url = all_prs[-1]
-            pr_match = re.search(r"/pull/(\d+)", pr_url)
-            if pr_match:
-                pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
+            stage_prs = [s.github_prs[-1] for s in p.stages if s.github_prs]
+            if len(stage_prs) > 1:
+                nums = []
+                for spr in stage_prs:
+                    m = re.search(r"/pull/(\d+)", spr)
+                    if m:
+                        nums.append(f"[link={spr}]#{m.group(1)}[/link]")
+                pr_display = " ".join(nums)
+            else:
+                pr_url = all_prs[-1]
+                m = re.search(r"/pull/(\d+)", pr_url)
+                if m:
+                    pr_display = f"[link={pr_url}]#{m.group(1)}[/link]"
 
-        # Branch — clickable, opens sandbox in VS Code
+        # Branch — prefer active stage branch over
+        # project-level branch
+        stage_branches = [s.branch for s in p.stages if s.branch]
         branch_display = "[dim]—[/dim]"
-        if p.branch:
+        if stage_branches:
+            active_br = None
+            for s in p.stages:
+                if s.branch and s.status not in ("done", "skipped"):
+                    active_br = s.branch
+                    break
+            br = active_br or stage_branches[-1]
+            if p.sandbox and Path(p.sandbox).exists():
+                branch_display = f"[link=vscode://file/{p.sandbox}]{br}[/link]"
+            else:
+                branch_display = br
+        elif p.branch:
             if p.sandbox and Path(p.sandbox).exists():
                 branch_display = f"[link=vscode://file/{p.sandbox}]{p.branch}[/link]"
             else:
@@ -783,13 +813,12 @@ def dashboard(ctx: typer.Context):
         # Sessions — compact indicators for tmux + dev
         session_parts = []
         tmux_matches = [
-            s for s in active_sessions
-            if s.startswith(f"arc-{p.slug}") and s != f"arc-{p.slug}-dev"
+            s for s in active_sessions if s.startswith(f"arc-{p.slug}") and s != f"arc-{p.slug}-dev"
         ]
         for s in tmux_matches:
             has_tmux_sessions = True
             # Extract session type from name: arc-slug -> "impl", arc-slug-ci -> "ci"
-            suffix = s[len(f"arc-{p.slug}"):]
+            suffix = s[len(f"arc-{p.slug}") :]
             label = suffix.lstrip("-") if suffix else "impl"
             if tmux_session_alive(s):
                 session_parts.append(f"[green]{label}[/green]")
@@ -883,7 +912,9 @@ model = "{organize_model}"
     config_path.write_text(config_content)
     console.print(f"\n[green]Config written to {config_path}[/green]")
     console.print(f"  Edit anytime: [bold]{config_path}[/bold]")
-    console.print("  Next: [bold]arc sync[/bold] to pull issues, or [bold]arc new <title>[/bold] to start a project")
+    console.print(
+        "  Next: [bold]arc sync[/bold] to pull issues, or [bold]arc new <title>[/bold] to start a project"
+    )
 
 
 @app.command(rich_help_panel="Project Management")
@@ -1036,7 +1067,11 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
 
     # Plans go in the project folder
     today = datetime.now().strftime("%Y-%m-%d")
-    plan_path = proj.folder / f"plan-{today}.md" if proj.folder else cfg.projects_dir / f"{proj.slug}-plan.md"
+    plan_path = (
+        proj.folder / f"plan-{today}.md"
+        if proj.folder
+        else cfg.projects_dir / f"{proj.slug}-plan.md"
+    )
     notes_path = project_notes_path(proj) if proj.folder else None
 
     stage_instructions = textwrap.dedent("""\
@@ -1091,7 +1126,9 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
 
     set_tab_title(f"arc: {project} (plan)")
     _set_project_env(proj)
-    plan_dir = Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
+    plan_dir = (
+        Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
+    )
     subprocess.run(
         [
             CLAUDE_BIN,
@@ -1220,11 +1257,16 @@ def stage_cmd(
 
     active_sessions = tmux_sessions()
 
+    # Check if any stage has a branch — show column only if needed
+    any_stage_branch = any(s.branch for s in proj.stages)
+
     table = Table(show_header=True, header_style="bold", padding=(0, 2))
     table.add_column("#", justify="right")
     table.add_column("Stage")
     table.add_column("Status")
     table.add_column("PR", no_wrap=True)
+    if any_stage_branch:
+        table.add_column("Branch", no_wrap=True, overflow="ellipsis", max_width=30)
     table.add_column("Depends")
     table.add_column("Sessions", no_wrap=True)
 
@@ -1240,23 +1282,32 @@ def stage_cmd(
             if pr_match:
                 pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
 
+        # Branch display
+        branch_display = "[dim]—[/dim]"
+        if s.branch:
+            if proj.sandbox and Path(proj.sandbox).exists():
+                branch_display = f"[link=vscode://file/{proj.sandbox}]{s.branch}[/link]"
+            else:
+                branch_display = s.branch
+
         deps_str = ", ".join(str(d) for d in s.depends_on) if s.depends_on else "—"
 
         # Sessions for this stage
-        stage_sessions = [
-            sess for sess in active_sessions
-            if sess.startswith(f"arc-{proj.slug}")
-        ]
+        stage_sessions = [sess for sess in active_sessions if sess.startswith(f"arc-{proj.slug}")]
         sess_str = "[dim]—[/dim]"
         if stage_sessions:
             parts = []
             for sess in stage_sessions:
-                suffix = sess[len(f"arc-{proj.slug}"):]
+                suffix = sess[len(f"arc-{proj.slug}") :]
                 label = suffix.lstrip("-") if suffix else "impl"
                 parts.append(f"[green]{label}[/green]")
             sess_str = " ".join(parts)
 
-        table.add_row(str(s.id), s.name, status_str, pr_display, deps_str, sess_str)
+        row = [str(s.id), s.name, status_str, pr_display]
+        if any_stage_branch:
+            row.append(branch_display)
+        row.extend([deps_str, sess_str])
+        table.add_row(*row)
 
     console.print(f"\n[bold]{proj.title}[/bold] — {proj.stage_progress()} stages done\n")
     console.print(table)
@@ -1508,14 +1559,22 @@ def _implement_interactive_staged(
     _set_project_env(proj)
     initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
     subprocess.run(
-        [CLAUDE_BIN, "--dangerously-skip-permissions", "--system-prompt", system_prompt, initial_msg],
+        [
+            CLAUDE_BIN,
+            "--dangerously-skip-permissions",
+            "--system-prompt",
+            system_prompt,
+            initial_msg,
+        ],
         cwd=sandbox_path,
         env=_clean_env(),
     )
     set_tab_title("")
 
     # Post-command: arc owns the status transition
-    append_session_note(proj, "implement", f"Stage {stage.id} ({stage.name}) implementation completed", stage=stage)
+    append_session_note(
+        proj, "implement", f"Stage {stage.id} ({stage.name}) implementation completed", stage=stage
+    )
     stage.status = "implemented"
     auto_promote_ready(proj)
     update_project_note(proj)
@@ -1653,7 +1712,12 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
 @app.command(rich_help_panel="Review & Ship")
 def approve(
     project: str = typer.Argument(autocompletion=complete_project),
-    stage: int = typer.Option(None, "--stage", "-s", help="Stage ID to approve (auto-detects first 'reviewed' stage if omitted)"),
+    stage: int = typer.Option(
+        None,
+        "--stage",
+        "-s",
+        help="Stage ID to approve (auto-detects first 'reviewed' stage if omitted)",
+    ),
 ):
     """Push branch, create PR, and launch CI monitor."""
     cfg = load_config()
@@ -1679,8 +1743,7 @@ def approve(
             if reviewed:
                 approving_stage = reviewed[0]
                 console.print(
-                    f"[dim]Auto-detected stage {approving_stage.id}: "
-                    f"{approving_stage.name}[/dim]"
+                    f"[dim]Auto-detected stage {approving_stage.id}: {approving_stage.name}[/dim]"
                 )
 
     if approving_stage:
@@ -1698,11 +1761,15 @@ def approve(
     # Generate PR summary from diff stat and commit log
     diff_stat = subprocess.run(
         ["git", "diff", "--stat", "origin/main"],
-        cwd=sandbox_path, capture_output=True, text=True,
+        cwd=sandbox_path,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     commit_log = subprocess.run(
         ["git", "log", "--oneline", "origin/main..HEAD"],
-        cwd=sandbox_path, capture_output=True, text=True,
+        cwd=sandbox_path,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     summary = f"Implementation of: {proj.title}"
@@ -1715,7 +1782,9 @@ def approve(
         )
         ai_result = subprocess.run(
             [CLAUDE_BIN, "-p", ai_prompt],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         if ai_result.returncode == 0 and ai_result.stdout.strip():
             summary = ai_result.stdout.strip()
@@ -1737,7 +1806,9 @@ def approve(
         )
         for f in tracked_arc_files:
             console.print(f"  [red]{f}[/red]")
-        console.print("[red]These must not be in the codebase. Removing from git and committing...[/red]")
+        console.print(
+            "[red]These must not be in the codebase. Removing from git and committing...[/red]"
+        )
         subprocess.run(["git", "rm", "--cached", *tracked_arc_files], cwd=sandbox_path, check=True)
         subprocess.run(
             ["git", "commit", "-m", "chore: remove accidentally tracked arc working files"],
@@ -1782,7 +1853,11 @@ def approve(
         # Use first tag that looks like a scope (not a type keyword)
         scope_candidates = [t for t in proj.tags if t.lower() not in _TAG_TO_TYPE]
         scope = f"({scope_candidates[0]})" if scope_candidates else ""
-        stage_suffix = f" (stage {approving_stage.id}: {approving_stage.name.lower()})" if approving_stage else ""
+        stage_suffix = (
+            f" (stage {approving_stage.id}: {approving_stage.name.lower()})"
+            if approving_stage
+            else ""
+        )
         default_title = f"{cc_type}{scope}: {proj.title.lower()}{stage_suffix}"
         if len(default_title) > 70:
             default_title = default_title[:67] + "..."
@@ -1798,8 +1873,7 @@ def approve(
     if proj.github_issues:
         # Use "Part of" for stage PRs with remaining stages, "Closes" for final
         remaining = approving_stage and any(
-            s.status not in ("done", "skipped") and s.id != approving_stage.id
-            for s in proj.stages
+            s.status not in ("done", "skipped") and s.id != approving_stage.id for s in proj.stages
         )
         verb = "Part of" if remaining else "Closes"
         issue_refs = f"\n\n{verb} " + ", ".join(
@@ -2006,7 +2080,9 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
 
     set_tab_title(f"arc: {project} (chat)")
     _set_project_env(proj)
-    chat_dir = Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
+    chat_dir = (
+        Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
+    )
     subprocess.run(
         [
             CLAUDE_BIN,
@@ -2029,7 +2105,10 @@ def review(
         DEFAULT_REVIEW_TOOL, "--tool", "-t", help="Review tool: 'claude' or 'codex'"
     ),
     model: str = typer.Option(
-        DEFAULT_REVIEW_MODEL, "--model", "-m", help="Model override (e.g. 'gpt-5.3-codex', 'claude-sonnet-4-20250514')"
+        DEFAULT_REVIEW_MODEL,
+        "--model",
+        "-m",
+        help="Model override (e.g. 'gpt-5.3-codex', 'claude-sonnet-4-20250514')",
     ),
 ):
     """Run AI code review on a project sandbox."""
@@ -2056,7 +2135,9 @@ def review(
         for s in proj.stages:
             if s.status == "implemented":
                 s.status = "reviewed"
-                append_session_note(proj, "review", f"Code review completed for stage {s.id} ({s.name})", stage=s)
+                append_session_note(
+                    proj, "review", f"Code review completed for stage {s.id} ({s.name})", stage=s
+                )
                 break
     else:
         append_session_note(proj, "review", f"Code review completed for {proj.title}")
@@ -2177,6 +2258,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     def _lockfile_digest(path: Path) -> str | None:
         try:
             import hashlib
+
             return hashlib.md5(path.read_bytes()).hexdigest()
         except FileNotFoundError:
             return None
@@ -2196,9 +2278,7 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
         text=True,
     )
     if result.returncode != 0:
-        subprocess.run(
-            ["git", "rebase", "--abort"], cwd=sandbox_path, capture_output=True
-        )
+        subprocess.run(["git", "rebase", "--abort"], cwd=sandbox_path, capture_output=True)
         console.print("[yellow]Rebase onto main failed.[/yellow]")
         console.print(f"[dim]{result.stderr.strip()}[/dim]")
         console.print("\n[bold]Options:[/bold]")
@@ -2399,7 +2479,9 @@ def done(
             console.print(f"[green]Now ready: {', '.join(names)}[/green]")
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
-            console.print(f"[cyan]All stages complete. Run [bold]arc done {proj.slug}[/bold] to close the project.[/cyan]")
+            console.print(
+                f"[cyan]All stages complete. Run [bold]arc done {proj.slug}[/bold] to close the project.[/cyan]"
+            )
     else:
         _kill_sessions(proj)
         proj.status = "done"
