@@ -157,12 +157,53 @@ def body_hash(body: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle classification (deterministic rules, mirrors arc migrate-lifecycle)
+# ---------------------------------------------------------------------------
+
+
+def classify_lifecycle(rel_path: str, fm: dict | None, projects_folder: str) -> tuple[str, str]:
+    """Return (lifecycle, source_type) for a note. Honors explicit fm overrides."""
+    if fm and fm.get("lifecycle") and fm.get("source_type"):
+        return str(fm["lifecycle"]), str(fm["source_type"])
+
+    parts = Path(rel_path).parts
+    name = Path(rel_path).name
+    top = parts[0] if parts else ""
+
+    # Project tree
+    if top == projects_folder:
+        if name == "index.md":
+            return "live", "project-meta"
+        if name == "notes.md":
+            return "log", "session-log"
+        if name == "plan.md":
+            return "live", "project-meta"
+        return "evergreen", "authored"
+
+    # Source URL → web clipping (regardless of folder)
+    if fm:
+        src = fm.get("source")
+        if isinstance(src, str) and src.startswith(("http://", "https://")):
+            return "reference", "web-clipping"
+
+    # Folder defaults
+    if top == "Clippings":
+        return "reference", "web-clipping"
+    if top == "Blogs":
+        return "frozen", "authored"
+    if top == "Research":
+        return "evergreen", "authored"
+
+    return "evergreen", "authored"
+
+
+# ---------------------------------------------------------------------------
 # Vault scanning
 # ---------------------------------------------------------------------------
 
 
 def scan_vault(cfg: dict, state: dict, logger: logging.Logger) -> list[dict]:
-    """Find new/changed .md files. Returns list of {path, rel, fm, body, hash}."""
+    """Find new/changed .md files. Returns list of {path, rel, fm, body, hash, lifecycle}."""
     vault = cfg["vault"]
     skip = set(cfg["skip_folders"])
     old_hashes = state.get("hashes", {})
@@ -182,11 +223,20 @@ def scan_vault(cfg: dict, state: dict, logger: logging.Logger) -> list[dict]:
 
         text = md.read_text(errors="replace")
         fm, body = split_note(text)
+
+        # Lifecycle filter: never touch logs or frozen notes
+        lifecycle, source_type = classify_lifecycle(str(rel), fm, cfg["projects_folder"])
+        if lifecycle in ("log", "frozen"):
+            continue
+
         h = body_hash(body)
         rel_str = str(rel)
 
         if old_hashes.get(rel_str) != h:
-            changed.append({"path": md, "rel": rel_str, "fm": fm, "body": body, "hash": h})
+            changed.append({
+                "path": md, "rel": rel_str, "fm": fm, "body": body, "hash": h,
+                "lifecycle": lifecycle, "source_type": source_type,
+            })
 
     return changed
 
@@ -411,7 +461,7 @@ def run(dry_run: bool = False) -> None:
     projects_dir = cfg["vault"] / cfg["projects_folder"]
 
     for note in changed:
-        logger.info("Processing: %s", note["rel"])
+        logger.info("Processing: %s (%s)", note["rel"], note["lifecycle"])
         result = classify_note(client, cfg["model"], note, vault_ctx, logger)
         if result is None:
             continue
@@ -419,15 +469,32 @@ def run(dry_run: bool = False) -> None:
         fm = note["fm"]
         body = note["body"]
 
-        # Apply tags
-        new_tags = result.get("tags", [])
-        new_content = apply_tags(note["path"], fm, body, new_tags, logger)
+        # Bake lifecycle + source_type into frontmatter if missing
+        baked = False
+        fm_to_write = dict(fm) if fm else {}
+        if not fm_to_write.get("lifecycle"):
+            fm_to_write["lifecycle"] = note["lifecycle"]
+            baked = True
+        if not fm_to_write.get("source_type"):
+            fm_to_write["source_type"] = note["source_type"]
+            baked = True
+        new_content = reassemble_note(fm_to_write, body) if baked else None
+        if baked:
+            logger.info("  +lifecycle %s/%s", note["lifecycle"], note["source_type"])
 
-        # Apply wikilinks to body
+        # Apply tags (operates on whatever we've built up so far)
+        if new_content:
+            fm_now, body_now = split_note(new_content)
+        else:
+            fm_now, body_now = fm, body
+        tagged = apply_tags(note["path"], fm_now, body_now, result.get("tags", []), logger)
+        if tagged:
+            new_content = tagged
+
+        # Apply wikilinks to body — only for non-reference notes (clippings stay pristine)
         wikilinks = result.get("wikilinks", [])
-        if wikilinks:
+        if wikilinks and note["lifecycle"] != "reference":
             if new_content:
-                # Re-split since we modified fm
                 fm_updated, body_updated = split_note(new_content)
                 body_updated = apply_wikilinks(body_updated, wikilinks, logger)
                 new_content = reassemble_note(fm_updated, body_updated)
@@ -435,6 +502,8 @@ def run(dry_run: bool = False) -> None:
                 body_updated = apply_wikilinks(body, wikilinks, logger)
                 if body_updated != body:
                     new_content = reassemble_note(fm or {}, body_updated)
+        elif wikilinks and note["lifecycle"] == "reference":
+            logger.debug("  skipping %d wikilink(s) — reference note", len(wikilinks))
 
         # Write note
         if new_content and not dry_run:

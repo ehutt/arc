@@ -5,6 +5,7 @@
 #     "typer>=0.15",
 #     "rich>=13",
 #     "pyyaml>=6",
+#     "anthropic>=0.40",
 # ]
 # ///
 """arc — lightweight agent project scaffolding."""
@@ -18,12 +19,13 @@ import socket
 import subprocess
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-import tomllib
+import tomllib  # type: ignore[import-not-found,unused-ignore]
 import typer
 import yaml
 from rich.console import Console
@@ -180,8 +182,8 @@ class Stage:
         """Conventional folder name: '{id}-{slugified-name}'."""
         return f"{self.id}-{slugify(self.name)}"
 
-    def to_dict(self) -> dict:
-        d: dict = {
+    def to_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {
             "id": self.id,
             "name": self.name,
             "status": self.status,
@@ -214,6 +216,12 @@ class Project:
     stages: list[Stage] = field(default_factory=list)
     dev_port: int = 0
     dev_session: str = ""
+    lifecycle: str = ""
+    source_type: str = ""
+    last_activity: str = ""
+    last_command: str = ""
+    open_prs: list[str] = field(default_factory=list)
+    active_stage: str = ""
     path: Path | None = None
 
     @property
@@ -222,7 +230,7 @@ class Project:
 
     @property
     def folder(self) -> Path | None:
-        if self.is_folder:
+        if self.is_folder and self.path is not None:
             return self.path.parent
         return None
 
@@ -246,8 +254,8 @@ class Project:
             rel_path = f"{cfg.projects_folder}/{self.slug}"
         return f"obsidian://open?vault={quote(vault_name)}&file={quote(rel_path)}"
 
-    def frontmatter_dict(self) -> dict:
-        d = {
+    def frontmatter_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {
             "title": self.title,
             "slug": self.slug,
             "status": self.status,
@@ -267,6 +275,18 @@ class Project:
             d["dev_port"] = self.dev_port
         if self.dev_session:
             d["dev_session"] = self.dev_session
+        if self.lifecycle:
+            d["lifecycle"] = self.lifecycle
+        if self.source_type:
+            d["source_type"] = self.source_type
+        if self.last_activity:
+            d["last_activity"] = self.last_activity
+        if self.last_command:
+            d["last_command"] = self.last_command
+        if self.open_prs:
+            d["open_prs"] = self.open_prs
+        if self.active_stage:
+            d["active_stage"] = self.active_stage
         return d
 
     def stage_progress(self) -> str:
@@ -296,6 +316,79 @@ class Project:
         done_ids = {s.id for s in self.stages if s.status in ("done", "skipped")}
         blocking_ids = [d for d in stage.depends_on if d not in done_ids]
         return [s for s in self.stages if s.id in blocking_ids]
+
+    def refresh_activity_footer(self, cfg: "Config", command_name: str) -> None:
+        """Update activity-footer fields on the project's index.md.
+
+        No-op for frozen lifecycles. Sets defaults for legacy projects that
+        predate the lifecycle schema. Best-effort gh PR lookup.
+        """
+        if not self.path or not self.path.exists():
+            return
+        if self.lifecycle == "frozen":
+            return
+
+        if not self.lifecycle:
+            self.lifecycle = "live"
+        if not self.source_type:
+            self.source_type = "project-meta"
+
+        self.last_activity = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.last_command = command_name
+
+        branches: list[str] = []
+        if self.branch:
+            branches.append(self.branch)
+        for s in self.stages:
+            if s.branch and s.branch not in branches:
+                branches.append(s.branch)
+
+        open_prs: list[str] = []
+        seen: set[int] = set()
+        for br in branches:
+            try:
+                r = subprocess.run(
+                    [
+                        "gh", "pr", "list",
+                        "--head", br,
+                        "--state", "open",
+                        "--repo", cfg.github_repo,
+                        "--json", "number,title",
+                    ],
+                    capture_output=True, text=True, timeout=8,
+                )
+                if r.returncode == 0:
+                    import json as _json
+                    for pr in _json.loads(r.stdout or "[]"):
+                        n = pr.get("number")
+                        if n in seen:
+                            continue
+                        seen.add(n)
+                        open_prs.append(f"{cfg.github_repo}#{n} {pr.get('title', '')}")
+            except (subprocess.SubprocessError, OSError, ValueError):
+                pass
+        self.open_prs = open_prs
+
+        if self.stages:
+            nxt = next(
+                (s for s in self.stages if s.status not in ("done", "skipped")),
+                None,
+            )
+            self.active_stage = f"{nxt.id} {nxt.name}" if nxt else ""
+        else:
+            self.active_stage = ""
+
+        update_project_note(self)
+
+
+def _refresh_project_activity(cfg: "Config", proj: "Project | None", command: str) -> None:
+    """Best-effort wrapper. Never raises."""
+    if proj is None:
+        return
+    try:
+        proj.refresh_activity_footer(cfg, command)
+    except Exception as e:
+        console.print(f"[dim]activity refresh skipped: {e}[/dim]")
 
 
 def derive_project_status(stages: list[Stage]) -> str:
@@ -331,7 +424,7 @@ def parse_project(path: Path) -> Project | None:
 
     def _safe_int(val: object, default: int = 0) -> int:
         try:
-            return int(val)  # type: ignore[arg-type]
+            return int(val)  # type: ignore[call-overload, no-any-return]
         except (ValueError, TypeError):
             return default
 
@@ -374,6 +467,12 @@ def parse_project(path: Path) -> Project | None:
         stages=stages,
         dev_port=_safe_int(fm.get("dev_port", 0)),
         dev_session=fm.get("dev_session", ""),
+        lifecycle=fm.get("lifecycle", ""),
+        source_type=fm.get("source_type", ""),
+        last_activity=str(fm.get("last_activity", "")),
+        last_command=fm.get("last_command", ""),
+        open_prs=fm.get("open_prs", []) or [],
+        active_stage=fm.get("active_stage", ""),
         path=path,
     )
     if proj.stages:
@@ -518,6 +617,8 @@ def create_project_note(
         updated=today,
         tags=["phoenix"],
         github_issues=[github_issue] if github_issue else [],
+        lifecycle="live",
+        source_type="project-meta",
         path=note_path,
     )
     fm = yaml.dump(project.frontmatter_dict(), default_flow_style=False, sort_keys=False)
@@ -734,7 +835,7 @@ def set_tab_title(title: str) -> None:
 
 
 @app.callback()
-def dashboard(ctx: typer.Context):
+def dashboard(ctx: typer.Context) -> None:
     """arc — project dashboard and scaffolding."""
     if ctx.invoked_subcommand is not None:
         return
@@ -801,14 +902,16 @@ def dashboard(ctx: typer.Context):
         # Sessions — compact indicators for tmux + dev
         session_parts = []
         tmux_matches = [
-            s for s in active_sessions if s.startswith(f"arc-{p.slug}") and s != f"arc-{p.slug}-dev"
+            sess
+            for sess in active_sessions
+            if sess.startswith(f"arc-{p.slug}") and sess != f"arc-{p.slug}-dev"
         ]
-        for s in tmux_matches:
+        for sess in tmux_matches:
             has_tmux_sessions = True
             # Extract session type from name: arc-slug -> "impl", arc-slug-ci -> "ci"
-            suffix = s[len(f"arc-{p.slug}") :]
+            suffix = sess[len(f"arc-{p.slug}") :]
             label = suffix.lstrip("-") if suffix else "impl"
-            if tmux_session_alive(s):
+            if tmux_session_alive(sess):
                 session_parts.append(f"[green]{label}[/green]")
             else:
                 session_parts.append(f"[yellow]{label}[/yellow]")
@@ -841,7 +944,7 @@ def dashboard(ctx: typer.Context):
 
 
 @app.command(rich_help_panel="Utilities")
-def init():
+def init() -> None:
     """Interactive setup — create config.toml from prompts."""
     config_path = Path(__file__).resolve().parent / "config.toml"
     if config_path.exists():
@@ -901,12 +1004,13 @@ model = "{organize_model}"
     console.print(f"\n[green]Config written to {config_path}[/green]")
     console.print(f"  Edit anytime: [bold]{config_path}[/bold]")
     console.print(
-        "  Next: [bold]arc sync[/bold] to pull issues, or [bold]arc new <title>[/bold] to start a project"
+        "  Next: [bold]arc sync[/bold] to pull issues, "
+        "or [bold]arc new <title>[/bold] to start a project"
     )
 
 
 @app.command(rich_help_panel="Project Management")
-def sync():
+def sync() -> None:
     """Pull GitHub issues and sync PR status from the configured repo."""
     cfg = load_config()
     projects = load_projects(cfg)
@@ -987,6 +1091,7 @@ def sync():
             if proj:
                 proj.github_issues.append(issue_ref)
                 update_project_note(proj)
+                _refresh_project_activity(cfg, proj, "sync")
                 console.print(f"  [green]Attached to {slug}[/green]")
             else:
                 console.print(f"  [red]Project {slug} not found[/red]")
@@ -1029,6 +1134,7 @@ def sync():
                     if pr_ref not in p.github_prs:
                         p.github_prs.append(pr_ref)
                         update_project_note(p)
+                        _refresh_project_activity(cfg, p, "sync")
                         console.print(f"  Updated {p.slug} with PR #{pr['number']}")
 
     bare = cfg.bare_repo
@@ -1041,7 +1147,7 @@ def sync():
 
 
 @app.command(rich_help_panel="Planning")
-def plan(project: str = typer.Argument(autocompletion=complete_project)):
+def plan(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     """Launch interactive Claude session to plan a project."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -1141,6 +1247,7 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)):
         auto_promote_ready(proj)
         ensure_stage_folders(proj)
     update_project_note(proj)
+    _refresh_project_activity(cfg, proj, "plan")
 
 
 @app.command("stage", rich_help_panel="Planning")
@@ -1151,7 +1258,7 @@ def stage_cmd(
         None, "--depends-on", help="Comma-separated stage IDs this depends on"
     ),
     plan_stage: int = typer.Option(None, "--plan", help="Launch Claude planning for this stage ID"),
-):
+) -> None:
     """Manage stages for a project."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -1302,7 +1409,7 @@ def stage_cmd(
 
 
 @app.command(rich_help_panel="Development")
-def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
+def sandbox(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     """Create an isolated Phoenix sandbox (worktree clone) for a project."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -1361,6 +1468,7 @@ def sandbox(project: str = typer.Argument(autocompletion=complete_project)):
     proj.sandbox = str(sandbox_path)
     proj.branch = branch_name
     update_project_note(proj)
+    _refresh_project_activity(cfg, proj, "sandbox")
 
     console.print(f"\n[green]Sandbox ready:[/green] {sandbox_path}")
     console.print(f"[green]Branch:[/green] {branch_name}")
@@ -1371,7 +1479,7 @@ def implement(
     project: str = typer.Argument(autocompletion=complete_project),
     stage_id: int = typer.Argument(None),
     bg: bool = typer.Option(False, "--bg", help="Run autonomously in background (tmux)"),
-):
+) -> None:
     """Implement a project or stage. Interactive by default, --bg for autonomous."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -1395,6 +1503,8 @@ def implement(
         _implement_interactive_staged(cfg, proj, sandbox_path, stage_id)
     else:
         _implement_interactive_simple(cfg, proj, sandbox_path)
+
+    _refresh_project_activity(cfg, proj, "implement")
 
 
 DEFAULT_REVIEW_TOOL = "codex"
@@ -1437,13 +1547,23 @@ def _run_review(
         {f"## Implementation Plans{plans_context}" if plans_context else ""}
 
         ## Review Instructions
-        Your primary job is a **code quality review**: focus on feature behavior correctness, edge cases, API ergonomics, logic errors, and subtle bugs.
+        Your primary job is a **code quality review**: focus on
+        feature behavior correctness, edge cases, API ergonomics,
+        logic errors, and subtle bugs.
 
         1. Run `git diff main` to see all changes
-        2. Review each changed file for correctness against the project requirements and plans above
-        3. Look for: logic errors, missed edge cases, off-by-one bugs, incorrect API usage, poor error messages, naming issues
-        4. As a secondary check, run tests (`{cfg.test_cmd}`) and lint (`{cfg.lint_cmd}`)
-        5. Fix any issues you find and commit fixes: stage ONLY the files you modified (never `git add .` or `git add -A`) with simple one-line commit messages (no co-authors). Before ending, commit any remaining modified files.
+        2. Review each changed file for correctness against the
+           project requirements and plans above
+        3. Look for: logic errors, missed edge cases, off-by-one
+           bugs, incorrect API usage, poor error messages,
+           naming issues
+        4. As a secondary check, run tests (`{cfg.test_cmd}`)
+           and lint (`{cfg.lint_cmd}`)
+        5. Fix any issues you find and commit fixes: stage ONLY
+           the files you modified (never `git add .` or
+           `git add -A`) with simple one-line commit messages
+           (no co-authors). Before ending, commit any remaining
+           modified files.
         6. Write review notes to: {notes_path}
 
         Do NOT update status in frontmatter — arc handles that.
@@ -1506,7 +1626,8 @@ def _implement_interactive_staged(
                 for path_fn, label in [(stage_plan_path, "Plan"), (stage_notes_path, "Notes")]:
                     p = path_fn(proj, dep_stage)
                     if p.exists() and p.stat().st_size > 0:
-                        dep_context += f"\n### Stage {dep_stage.id} ({dep_stage.name}) — {label}\n{p.read_text()}\n"
+                        header = f"\n### Stage {dep_stage.id} ({dep_stage.name}) — {label}\n"
+                        dep_context += f"{header}{p.read_text()}\n"
 
     # Current stage plan
     plan_content = ""
@@ -1531,7 +1652,11 @@ def _implement_interactive_staged(
         Branch: {proj.branch}
 
         ## Git
-        Use git to track your changes. After every meaningful change, stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
+        Use git to track your changes. After every meaningful
+        change, stage ONLY the files you modified for this
+        feature (never `git add .` or `git add -A`) and commit
+        with a simple one-line message (no co-authors). Before
+        ending your session, commit any remaining modified files.
 
         ## Notes
         Write session notes to: {notes_path}
@@ -1584,7 +1709,11 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
         Branch: {proj.branch}
 
         ## Git
-        Use git to track your changes. After every meaningful change, stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
+        Use git to track your changes. After every meaningful
+        change, stage ONLY the files you modified for this
+        feature (never `git add .` or `git add -A`) and commit
+        with a simple one-line message (no co-authors). Before
+        ending your session, commit any remaining modified files.
 
         ## Notes
         Write session notes to: {notes_path or proj.path}
@@ -1634,7 +1763,12 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         3. Run tests: `{cfg.test_cmd}`
         4. Run lint: `{cfg.lint_cmd}`
         5. Fix any failures
-        6. Commit your work after every meaningful change: stage ONLY the files you modified for this feature (never `git add .` or `git add -A`) and commit with a simple one-line message (no co-authors). Before ending your session, commit any remaining modified files.
+        6. Commit your work after every meaningful change:
+           stage ONLY the files you modified for this feature
+           (never `git add .` or `git add -A`) and commit with
+           a simple one-line message (no co-authors). Before
+           ending your session, commit any remaining modified
+           files.
         7. When done, write session notes to: {notes_path}
 
         Do NOT update status in frontmatter — arc handles that.
@@ -1664,13 +1798,25 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         # Strip conda/virtualenv env vars to avoid package resolution issues
         unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_SHLVL CONDA_EXE
         unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT
-        export PATH=$(echo "$PATH" | tr ':' '\\n' | grep -v -e miniconda -e anaconda -e '\\.venv' | tr '\\n' ':' | sed 's/:$//')
+        export PATH=$(echo "$PATH" | tr ':' '\\n' \
+          | grep -v -e miniconda -e anaconda -e '\\.venv' \
+          | tr '\\n' ':' | sed 's/:$//')
 
         echo "=== arc: Starting implementation (Claude) for {proj.slug} ==="
 
-        {CLAUDE_BIN} --dangerously-skip-permissions -p "Read CLAUDE.md. Implement all tasks. Run tests. Track your changes with git: after every meaningful change, stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Before finishing, commit any remaining modified files. Write session notes to {notes_path}. NEVER write summary/notes/review files into the codebase."
+        {CLAUDE_BIN} --dangerously-skip-permissions -p "Read CLAUDE.md. \
+Implement all tasks. Run tests. Track your changes with git: \
+after every meaningful change, stage ONLY the files you \
+modified (never git add . or git add -A) and commit with a \
+simple one-line message (no co-authors). Before finishing, \
+commit any remaining modified files. \
+Write session notes to {notes_path}. \
+NEVER write summary/notes/review files into the codebase."
 
-        osascript -e 'display notification "Implementation complete for {proj.slug}. Run: arc review {proj.slug}" with title "arc: {proj.slug}"'
+        osascript -e 'display notification \
+"Implementation complete for {proj.slug}. \
+Run: arc review {proj.slug}" \
+with title "arc: {proj.slug}"'
         echo -e "\\a"
         echo "=== arc: {proj.slug} implementation complete. Review with: arc review {proj.slug} ==="
     """)
@@ -1706,7 +1852,7 @@ def approve(
         "-s",
         help="Stage ID to approve (auto-detects first 'reviewed' stage if omitted)",
     ),
-):
+) -> None:
     """Push branch, create PR, and launch CI monitor."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -1764,8 +1910,17 @@ def approve(
     if diff_stat or commit_log:
         ai_prompt = (
             f"Given this diff stat and commit log for a PR titled '{proj.title}', "
-            f"write a brief PR description as 3-5 bullet points. "
-            f"Be concise and technical. Do not reference project management tools or notes.\n\n"
+            f"write a PR description following this format:\n\n"
+            f"## Summary\n<2-5 concise bullet points describing what changed and why>\n\n"
+            f"## Test plan\n<bulleted checklist of how to verify the changes>\n\n"
+            f"Rules:\n"
+            f"- Be concise and technical\n"
+            f"- Focus on what the code does, not project management context\n"
+            f"- Do not reference project management tools, notes, or internal processes\n"
+            f"- The PR title will use conventional commits format "
+            f"(feat, fix, docs, chore, refactor, perf, test, ci, build, style) "
+            f"— do not repeat the type prefix in the body\n"
+            f"- Do not include scope in the PR title unless it adds clarity\n\n"
             f"Diff stat:\n{diff_stat}\n\nCommit log:\n{commit_log}"
         )
         ai_result = subprocess.run(
@@ -1790,10 +1945,12 @@ def approve(
             tracked_arc_files.append(str(f))
     if tracked_arc_files:
         console.print(
-            f"[red bold]ERROR: {len(tracked_arc_files)} arc working file(s) are tracked in git:[/red bold]"
+            "[red bold]ERROR: "
+            f"{len(tracked_arc_files)} arc working file(s)"
+            " are tracked in git:[/red bold]"
         )
-        for f in tracked_arc_files:
-            console.print(f"  [red]{f}[/red]")
+        for tf in tracked_arc_files:
+            console.print(f"  [red]{tf}[/red]")
         console.print(
             "[red]These must not be in the codebase. Removing from git and committing...[/red]"
         )
@@ -1870,17 +2027,17 @@ def approve(
 
     pr_body = f"{summary}{issue_refs}"
 
-    result = subprocess.run(
+    pr_result = subprocess.run(
         ["gh", "pr", "create", "--repo", cfg.github_repo, "--title", pr_title, "--body", pr_body],
         cwd=sandbox_path,
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
-        console.print(f"[red]PR creation failed: {result.stderr}[/red]")
+    if pr_result.returncode != 0:
+        console.print(f"[red]PR creation failed: {pr_result.stderr}[/red]")
         raise typer.Exit(1)
 
-    pr_url = result.stdout.strip()
+    pr_url = pr_result.stdout.strip()
     console.print(f"[green]PR created: {pr_url}[/green]")
 
     # Track PR on the stage (if staged) and on the project
@@ -1934,7 +2091,9 @@ if m:
     p.write_text('---\\n' + new_fm + '---\\n' + body)
 "
                 [ -n "{ci_notes_file}" ] && echo "- **ci**: PR merged" >> "{ci_notes_file}"
-                osascript -e 'display notification "Stage {approving_stage.id} merged!" with title "arc: {proj.slug}"'
+                osascript -e 'display notification \
+"Stage {approving_stage.id} merged!" \
+with title "arc: {proj.slug}"'
                 break'''
     else:
         merge_handler = f'''
@@ -1969,16 +2128,23 @@ p.write_text(text)
         while true; do
             sleep 60
 
-            state=$(gh pr view --repo {cfg.github_repo} --json state -q '.state' 2>/dev/null || echo "unknown")
+            state=$(gh pr view {proj.branch} --repo {cfg.github_repo} \
+              --json state -q '.state' \
+              2>/dev/null || echo "unknown")
 
             if [ "$state" = "MERGED" ]; then
 {merge_handler}
             fi
 
             # Check review/approval status
-            review_decision=$(gh pr view --repo {cfg.github_repo} --json reviewDecision -q '.reviewDecision' 2>/dev/null || echo "")
+            review_decision=$(gh pr view {proj.branch} \
+              --repo {cfg.github_repo} \
+              --json reviewDecision \
+              -q '.reviewDecision' \
+              2>/dev/null || echo "")
 
-            checks=$(gh pr checks --repo {cfg.github_repo} 2>/dev/null || echo "pending")
+            checks=$(gh pr checks {proj.branch} \
+              --repo {cfg.github_repo} 2>/dev/null || echo "pending")
 
             # Determine current status
             if [ "$review_decision" = "APPROVED" ]; then
@@ -1998,17 +2164,27 @@ p.write_text(text)
 
                 case "$new_status" in
                     ci-failing)
-                        osascript -e 'display notification "CI failing — launching fix agent" with title "arc: {proj.slug}"'
-                        {CLAUDE_BIN} --dangerously-skip-permissions -p "CI is failing on this PR. Run gh pr checks to see failures. Read the failing logs. Fix the issues. Run tests locally. Stage ONLY the files you modified (never git add . or git add -A) and commit with a simple one-line message (no co-authors). Push."
+                        osascript -e 'display notification \
+"CI failing — launching fix agent" \
+with title "arc: {proj.slug}"'
+                        {CLAUDE_BIN} --dangerously-skip-permissions \
+-p "CI is failing on this PR. Run gh pr checks \
+to see failures. Read the failing logs. Fix the \
+issues. Run tests locally. Stage ONLY the files \
+you modified (never git add . or git add -A) and \
+commit with a simple one-line message \
+(no co-authors). Push."
                         append_note "Auto-fix pushed"
                         prev_status=""
                         continue
                         ;;
                     ci-passing)
-                        osascript -e 'display notification "CI passing" with title "arc: {proj.slug}"'
+                        osascript -e 'display notification \
+"CI passing" with title "arc: {proj.slug}"'
                         ;;
                     pr-approved)
-                        osascript -e 'display notification "PR approved!" with title "arc: {proj.slug}"'
+                        osascript -e 'display notification \
+"PR approved!" with title "arc: {proj.slug}"'
                         ;;
                 esac
                 prev_status="$new_status"
@@ -2028,10 +2204,11 @@ p.write_text(text)
         console.print(f"[green]CI monitor launched: {sess_name}[/green]")
 
     console.print(f"\n[bold]Done![/bold] PR: {pr_url}")
+    _refresh_project_activity(cfg, proj, "approve")
 
 
 @app.command("note", rich_help_panel="Project Management")
-def note_cmd(project: str = typer.Argument(autocompletion=complete_project)):
+def note_cmd(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     """Open a project's Obsidian note."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -2041,7 +2218,7 @@ def note_cmd(project: str = typer.Argument(autocompletion=complete_project)):
 
 
 @app.command(rich_help_panel="Utilities")
-def chat(project: str = typer.Argument(autocompletion=complete_project)):
+def chat(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     """Launch an informal Claude chat with project context."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -2058,7 +2235,10 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
         {sandbox_info}
         Obsidian vault: {cfg.obsidian_vault}
 
-        You have context about this project. The user wants to chat informally — answer questions, brainstorm, help think through problems. If they reference code, you can read files in the sandbox path.
+        You have context about this project. The user wants
+        to chat informally — answer questions, brainstorm,
+        help think through problems. If they reference code,
+        you can read files in the sandbox path.
     """)
 
     initial_msg = f"Read the project note at {note_path}"
@@ -2084,6 +2264,7 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)):
     set_tab_title("")
 
     append_session_note(proj, "chat", f"Chat session about {proj.title}")
+    _refresh_project_activity(cfg, proj, "chat")
 
 
 @app.command(rich_help_panel="Review & Ship")
@@ -2098,7 +2279,7 @@ def review(
         "-m",
         help="Model override (e.g. 'gpt-5.3-codex', 'claude-sonnet-4-20250514')",
     ),
-):
+) -> None:
     """Run AI code review on a project sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -2130,13 +2311,14 @@ def review(
     else:
         append_session_note(proj, "review", f"Code review completed for {proj.title}")
     update_project_note(proj)
+    _refresh_project_activity(cfg, proj, "review")
 
 
 @app.command(rich_help_panel="Development")
 def editor(
     project: str = typer.Argument(autocompletion=complete_project),
     use_cursor: bool = typer.Option(False, "--cursor", help="Open in Cursor instead of VS Code"),
-):
+) -> None:
     """Open project sandbox in VS Code (or Cursor with --cursor) with changed files."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -2220,7 +2402,7 @@ def _load_env_keys(cfg: Config) -> None:
 
 
 @app.command(rich_help_panel="Development")
-def dev(project: str = typer.Argument(autocompletion=complete_project)):
+def dev(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     """Launch local Phoenix dev server in tmux for a project sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -2278,11 +2460,12 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
         console.print("[dim]Continuing on current branch...[/dim]")
 
     # Install dependencies if needed
+    node_modules = sandbox_path / "app" / "node_modules"
     if not (sandbox_path / ".venv").exists():
         # First-time setup
         console.print("[bold]Running initial setup (make setup)...[/bold]")
-        result = subprocess.run(["make", "setup"], cwd=sandbox_path)
-        if result.returncode != 0:
+        setup_result = subprocess.run(["make", "setup"], cwd=sandbox_path)
+        if setup_result.returncode != 0:
             console.print("[red]Setup failed[/red]")
             raise typer.Exit(1)
     else:
@@ -2292,9 +2475,15 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
         if post_uv != pre_uv:
             console.print("[dim]Python lockfile changed — running uv sync...[/dim]")
             subprocess.run(["uv", "sync"], cwd=sandbox_path)
-        if post_pnpm != pre_pnpm:
-            console.print("[dim]Node lockfile changed — running pnpm install...[/dim]")
-            subprocess.run(["pnpm", "install"], cwd=sandbox_path / "app")
+        if post_pnpm != pre_pnpm or not node_modules.exists():
+            reason = "node_modules missing" if not node_modules.exists() else "lockfile changed"
+            console.print(
+                f"[dim]Node dependencies needed ({reason}) — running pnpm install...[/dim]"
+            )
+            pnpm_result = subprocess.run(["pnpm", "install"], cwd=sandbox_path / "app")
+            if pnpm_result.returncode != 0:
+                console.print("[red]pnpm install failed[/red]")
+                raise typer.Exit(1)
 
     # Step 1: Stale session cleanup
     if proj.dev_session and not tmux_session_exists(proj.dev_session):
@@ -2349,12 +2538,14 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
             port = 6006
             if not is_port_free(6006):
                 console.print(
-                    "[yellow]Warning: port 6006 not yet free, server may take a moment to bind[/yellow]"
+                    "[yellow]Warning: port 6006 not yet free,"
+                    " server may take a moment to bind[/yellow]"
                 )
         else:
             port = next_port
 
     # Step 5: Launch in tmux background
+    dev_log = Path(f"/tmp/arc-dev-{proj.slug}.log")
     dev_script = Path(f"/tmp/arc-dev-{proj.slug}.sh")
     lines = ["#!/usr/bin/env bash"]
     for key in MODEL_API_KEYS:
@@ -2366,14 +2557,74 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
         lines.append(f"unset {var}")
     lines.append(f'export PHOENIX_WORKING_DIR="{Path.home() / ".phoenix"}"')
     lines.append(f"export PHOENIX_PORT={port}")
-    lines.append(f'exec make -C "{sandbox_path}" dev')
+    # Find free ports for all auxiliary services
+    debugpy_port = next_free_port(5678)
+    vite_port = next_free_port(5173)
+    grpc_port = next_free_port(4317)
+    lines.append(f"export DEBUGPY_PORT={debugpy_port}")
+    lines.append(f"export VITE_PORT={vite_port}")
+    lines.append(f"export PHOENIX_GRPC_PORT={grpc_port}")
+    lines.append(f'make -C "{sandbox_path}" dev 2>&1 | tee "{dev_log}"')
     dev_script.write_text("\n".join(lines) + "\n")
     dev_script.chmod(0o755)
 
     session_name = f"arc-{proj.slug}-dev"
     if tmux_session_exists(session_name):
-        subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
-    subprocess.run(["tmux", "new-session", "-d", "-s", session_name, str(dev_script)], check=True)
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session_name],
+            capture_output=True,
+        )
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            str(dev_script),
+        ],
+        check=True,
+    )
+
+    # Health check: wait for the port to become reachable, or
+    # detect early failure (tmux session dies, or timeout).
+    console.print("[dim]Waiting for Phoenix to start...[/dim]")
+    deadline = time.time() + 15
+    started = False
+    while time.time() < deadline:
+        if not tmux_session_exists(session_name):
+            # Session died — immediate failure
+            break
+        if not is_port_free(port):
+            started = True
+            break
+        time.sleep(1)
+
+    def _show_log_tail() -> None:
+        if dev_log.exists():
+            # Strip ANSI escape sequences for readability
+            import re as _re
+
+            raw = dev_log.read_text()
+            clean = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+            lines = [ln for ln in clean.strip().splitlines() if ln.strip()]
+            if lines:
+                console.print("[dim]── log tail ──[/dim]")
+                for ln in lines[-25:]:
+                    console.print(f"  [dim]{ln}[/dim]")
+
+    if not started:
+        console.print("\n[red bold]Dev server failed to start![/red bold]")
+        _show_log_tail()
+        if tmux_session_exists(session_name):
+            console.print(
+                "\n[yellow]Tmux session is still running (mprocs may be open with errors).[/yellow]"
+            )
+            console.print(f"  [dim]Attach:[/dim]  tmux attach -t {session_name}")
+        proj.dev_port = 0
+        proj.dev_session = ""
+        update_project_note(proj)
+        raise typer.Exit(1)
 
     proj.dev_port = port
     proj.dev_session = session_name
@@ -2383,11 +2634,13 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)):
     console.print(f"  [dim]UI:[/dim]      http://localhost:{port}")
     console.print(f"  [dim]Session:[/dim] {session_name}")
     console.print(f"  [dim]Attach:[/dim]  tmux attach -t {session_name}")
+    console.print(f"  [dim]Log:[/dim]     {dev_log}")
     console.print("  [dim]DB:[/dim]      ~/.phoenix")
+    _refresh_project_activity(cfg, proj, "dev")
 
 
 @app.command(rich_help_panel="Project Management")
-def new(title: str = typer.Argument(..., help="Project title")):
+def new(title: str = typer.Argument(..., help="Project title")) -> None:
     """Create a new project note without a GitHub issue."""
     cfg = load_config()
     slug = slugify(title)
@@ -2429,7 +2682,7 @@ def done(
     project: str = typer.Argument(autocompletion=complete_project),
     stage_id: int = typer.Argument(None),
     skip: bool = typer.Option(False, "--skip", help="Mark as skipped instead of done"),
-):
+) -> None:
     """Mark a stage (or whole project) as done and clean up sessions."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -2443,6 +2696,7 @@ def done(
                 # All stages done — mark the project itself as done
                 _kill_sessions(proj)
                 proj.status = "done"
+                proj.lifecycle = "frozen"
                 proj.dev_port = 0
                 proj.dev_session = ""
                 update_project_note(proj)
@@ -2468,11 +2722,14 @@ def done(
 
         if all(s.status in ("done", "skipped") for s in proj.stages):
             console.print(
-                f"[cyan]All stages complete. Run [bold]arc done {proj.slug}[/bold] to close the project.[/cyan]"
+                f"[cyan]All stages complete. Run "
+                f"[bold]arc done {proj.slug}[/bold]"
+                " to close the project.[/cyan]"
             )
     else:
         _kill_sessions(proj)
         proj.status = "done"
+        proj.lifecycle = "frozen"
         proj.dev_port = 0
         proj.dev_session = ""
         update_project_note(proj)
@@ -2480,7 +2737,7 @@ def done(
 
 
 @app.command(rich_help_panel="Project Management")
-def archive(project: str = typer.Argument(autocompletion=complete_project)):
+def archive(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     """Shelve a project — kill sessions but preserve sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
@@ -2488,10 +2745,386 @@ def archive(project: str = typer.Argument(autocompletion=complete_project)):
     _kill_sessions(proj)
 
     proj.status = "archived"
+    proj.lifecycle = "frozen"
     proj.dev_port = 0
     proj.dev_session = ""
     update_project_note(proj)
     console.print(f"[green]{proj.slug} archived.[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle migration (one-shot, idempotent)
+# ---------------------------------------------------------------------------
+
+VAULT_SKIP_FOLDERS = {"Templates", ".obsidian", "Assets"}
+
+
+def _split_fm(text: str) -> tuple[dict | None, str]:
+    """Split note text into (frontmatter dict, body). Returns (None, text) if absent."""
+    m = re.match(r"^---\n(.*?\n)---\n", text, re.DOTALL)
+    if not m:
+        return None, text
+    try:
+        fm = yaml.safe_load(m.group(1))
+        if not isinstance(fm, dict):
+            return None, text
+        return fm, text[m.end():]
+    except yaml.YAMLError:
+        return None, text
+
+
+def _classify_for_migrate(rel: Path, fm: dict | None, projects_folder: str) -> tuple[str, str]:
+    """Return (lifecycle, source_type). Honors explicit fm.lifecycle/source_type."""
+    if fm and fm.get("lifecycle") and fm.get("source_type"):
+        return str(fm["lifecycle"]), str(fm["source_type"])
+
+    parts = rel.parts
+    name = rel.name
+    top = parts[0] if parts else ""
+
+    if top == projects_folder:
+        if name == "index.md":
+            status = (fm or {}).get("status", "")
+            if status in ("archived", "done"):
+                return "frozen", "project-meta"
+            return "live", "project-meta"
+        if name == "notes.md":
+            return "log", "session-log"
+        if name == "plan.md":
+            return "live", "project-meta"
+        return "evergreen", "authored"
+
+    if fm:
+        src = fm.get("source")
+        if isinstance(src, str) and src.startswith(("http://", "https://")):
+            return "reference", "web-clipping"
+
+    if top == "Clippings":
+        return "reference", "web-clipping"
+    if top == "Blogs":
+        return "frozen", "authored"
+    if top == "Research":
+        return "evergreen", "authored"
+
+    return "evergreen", "authored"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+@app.command("migrate-lifecycle", rich_help_panel="Utilities")
+def migrate_lifecycle(
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview without writing"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Print each note's classification"),
+) -> None:
+    """One-shot: bake lifecycle + source_type frontmatter into every vault note. Idempotent."""
+    cfg = load_config()
+    vault = cfg.obsidian_vault
+    if not vault.exists():
+        console.print(f"[red]Vault not found: {vault}[/red]")
+        raise typer.Exit(1)
+
+    counts_lc: dict[str, int] = {}
+    counts_st: dict[str, int] = {}
+    written = 0
+    already = 0
+    no_fm = 0
+    examined = 0
+
+    for md in sorted(vault.rglob("*.md")):
+        rel = md.relative_to(vault)
+        if any(part in VAULT_SKIP_FOLDERS for part in rel.parts):
+            continue
+        if md.name.startswith(".") and md.name.endswith(".icloud"):
+            continue
+        examined += 1
+
+        try:
+            text = md.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            console.print(f"[yellow]skip {rel}: {e}[/yellow]")
+            continue
+        fm, body = _split_fm(text)
+
+        lifecycle, source_type = _classify_for_migrate(rel, fm, cfg.projects_folder)
+
+        had_lc = bool(fm and fm.get("lifecycle"))
+        had_st = bool(fm and fm.get("source_type"))
+
+        counts_lc[lifecycle] = counts_lc.get(lifecycle, 0) + 1
+        counts_st[source_type] = counts_st.get(source_type, 0) + 1
+
+        if had_lc and had_st:
+            already += 1
+            if verbose:
+                console.print(f"  [dim]= {rel}[/dim]")
+            continue
+
+        new_fm = dict(fm) if fm else {}
+        if not had_lc:
+            new_fm["lifecycle"] = lifecycle
+        if not had_st:
+            new_fm["source_type"] = source_type
+
+        if fm is None:
+            no_fm += 1
+
+        if verbose:
+            tag = "+" if not dry_run else "?"
+            console.print(f"  [green]{tag}[/green] {rel} → {lifecycle}/{source_type}")
+
+        if not dry_run:
+            fm_str = yaml.dump(new_fm, default_flow_style=False, sort_keys=False, allow_unicode=True)
+            _atomic_write_text(md, f"---\n{fm_str}---\n{body}")
+        written += 1
+
+    label = "[yellow]DRY RUN[/yellow] would write" if dry_run else "wrote"
+    console.print(f"\n[bold]Migration {'preview' if dry_run else 'complete'}[/bold]")
+    console.print(f"  examined:           {examined}")
+    console.print(f"  already classified: {already}")
+    console.print(f"  notes without fm:   {no_fm}  [dim](fm will be added)[/dim]")
+    console.print(f"  {label}: {written}")
+    console.print("\n[bold]By lifecycle:[/bold]")
+    for k in sorted(counts_lc):
+        console.print(f"  {k:11s} {counts_lc[k]}")
+    console.print("\n[bold]By source_type:[/bold]")
+    for k in sorted(counts_st):
+        console.print(f"  {k:14s} {counts_st[k]}")
+    if dry_run:
+        console.print("\n[dim]Run without --dry-run to apply.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Vault search (natural-language)
+# ---------------------------------------------------------------------------
+
+
+def _get_anthropic_key() -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", "vault-organize", "-s", "ANTHROPIC_API_KEY", "-w"],
+            capture_output=True, text=True, check=True,
+        )
+        return r.stdout.strip()
+    except subprocess.CalledProcessError:
+        console.print("[red]ANTHROPIC_API_KEY not found in env or Keychain[/red]")
+        raise typer.Exit(1)
+
+
+def _grep_candidates(vault: Path, keyphrase: str, limit: int = 40) -> list[Path]:
+    rg = shutil.which("rg")
+    if rg:
+        cmd = [rg, "-l", "-i", "--type", "md", keyphrase, str(vault)]
+    else:
+        cmd = ["grep", "-r", "-l", "-i", "--include=*.md", keyphrase, str(vault)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if r.returncode not in (0, 1):
+        return []
+    return [Path(p) for p in r.stdout.splitlines() if p.strip()][:limit]
+
+
+def _vault_obsidian_url(cfg: Config, rel_path: Path) -> str:
+    vault_name = cfg.obsidian_vault.name
+    no_ext = str(rel_path.with_suffix(""))
+    return f"obsidian://open?vault={quote(vault_name)}&file={quote(no_ext)}"
+
+
+_LIFECYCLE_COLORS = {
+    "live": "green", "evergreen": "cyan", "log": "dim",
+    "frozen": "blue", "reference": "magenta",
+}
+
+
+@app.command(rich_help_panel="Knowledge")
+def search(
+    query: str = typer.Argument(..., help="Natural-language search query (filters can be inline)"),
+    n: int = typer.Option(10, "-n", "--limit", help="Max results"),
+    model: str = typer.Option("claude-sonnet-4-20250514", "--model"),
+) -> None:
+    """Search the Obsidian vault with natural language."""
+    cfg = load_config()
+    vault = cfg.obsidian_vault
+    if not vault.exists():
+        console.print(f"[red]Vault not found: {vault}[/red]")
+        raise typer.Exit(1)
+
+    import json as _json
+    try:
+        import anthropic
+    except ImportError:
+        console.print("[red]anthropic package not installed (uv should auto-install)[/red]")
+        raise typer.Exit(1)
+
+    client = anthropic.Anthropic(api_key=_get_anthropic_key())
+
+    extract_prompt = textwrap.dedent(f"""\
+        Parse this Obsidian vault search query and extract keyphrases plus any filter intent.
+
+        Vault top-level folders: Agents, Benchmarking, Blogs, Career, Clippings,
+        Phoenix Evals, Projects, Prompt Templates, Research, Weekly Priorities.
+
+        Lifecycle classes: live, log, frozen, evergreen, reference.
+        Source types: project-meta, session-log, web-clipping, authored.
+
+        Return JSON only, no fences:
+        {{
+          "keyphrases": ["3-5 short phrases (1-3 words each), used for grep"],
+          "exclude_lifecycle": [],
+          "include_lifecycle": [],
+          "include_folder": [],
+          "exclude_folder": [],
+          "include_source_type": []
+        }}
+
+        Examples:
+        - "evaluator bias methodology" → keyphrases:["evaluator bias","judge bias","evaluation methodology"]
+        - "agent trajectory eval, skip my old blog drafts" → exclude_folder:["Blogs"]
+        - "active project notes about phoenix client" → include_lifecycle:["live"], keyphrases:["phoenix client"]
+        - "any clippings on RAG" → include_source_type:["web-clipping"], keyphrases:["RAG","retrieval augmented"]
+
+        Query: {query}
+    """)
+    r = client.messages.create(
+        model=model, max_tokens=512,
+        messages=[{"role": "user", "content": extract_prompt}],
+    )
+    raw = r.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```\w*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError:
+        console.print(f"[red]Could not parse keyphrase response:[/red] {raw[:200]}")
+        raise typer.Exit(1)
+
+    keyphrases = parsed.get("keyphrases") or [query]
+    excl_lc = set(parsed.get("exclude_lifecycle") or [])
+    incl_lc = set(parsed.get("include_lifecycle") or [])
+    incl_fd = set(parsed.get("include_folder") or [])
+    excl_fd = set(parsed.get("exclude_folder") or [])
+    incl_st = set(parsed.get("include_source_type") or [])
+
+    console.print(f"[dim]Search keyphrases:[/dim] {', '.join(keyphrases)}")
+    filt = []
+    if incl_lc: filt.append(f"lifecycle ∈ {sorted(incl_lc)}")
+    if excl_lc: filt.append(f"lifecycle ∉ {sorted(excl_lc)}")
+    if incl_fd: filt.append(f"folder ∈ {sorted(incl_fd)}")
+    if excl_fd: filt.append(f"folder ∉ {sorted(excl_fd)}")
+    if incl_st: filt.append(f"source_type ∈ {sorted(incl_st)}")
+    if filt:
+        console.print(f"[dim]Filters:[/dim] {' AND '.join(filt)}")
+
+    candidates: dict[Path, int] = {}
+    for kp in keyphrases:
+        for p in _grep_candidates(vault, kp, limit=40):
+            candidates[p] = candidates.get(p, 0) + 1
+
+    if not candidates:
+        console.print("[yellow]No matches.[/yellow]")
+        return
+
+    enriched: list[dict] = []
+    for path, hits in candidates.items():
+        try:
+            txt = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fm, body = _split_fm(txt)
+        rel = path.relative_to(vault)
+        top = rel.parts[0] if rel.parts else ""
+
+        if fm and fm.get("lifecycle"):
+            lc = str(fm["lifecycle"])
+        else:
+            lc, _ = _classify_for_migrate(rel, fm, cfg.projects_folder)
+        if fm and fm.get("source_type"):
+            st = str(fm["source_type"])
+        else:
+            _, st = _classify_for_migrate(rel, fm, cfg.projects_folder)
+
+        if incl_lc and lc not in incl_lc: continue
+        if excl_lc and lc in excl_lc: continue
+        if incl_fd and top not in incl_fd: continue
+        if excl_fd and top in excl_fd: continue
+        if incl_st and st not in incl_st: continue
+
+        title = (fm or {}).get("title") or path.stem
+        snippet = " ".join(body[:600].split())
+        enriched.append({
+            "path": path, "rel": str(rel), "top": top, "title": title,
+            "lifecycle": lc, "source_type": st,
+            "snippet": snippet, "hits": hits,
+        })
+
+    if not enriched:
+        console.print("[yellow]No matches after filters.[/yellow]")
+        return
+
+    enriched.sort(key=lambda x: -x["hits"])
+    enriched = enriched[:30]
+
+    rerank_input = [
+        {
+            "id": i, "title": x["title"], "path": x["rel"],
+            "lifecycle": x["lifecycle"], "source_type": x["source_type"],
+            "snippet": x["snippet"][:400],
+        }
+        for i, x in enumerate(enriched)
+    ]
+    rerank_prompt = textwrap.dedent(f"""\
+        User query: {query}
+
+        Rank the top {n} most relevant notes from these candidates and write
+        ONE short sentence explaining the relevance for each.
+
+        Return JSON only, no fences:
+        {{"results": [{{"id": <int>, "reason": "..."}}, ...]}}
+
+        Candidates:
+        {_json.dumps(rerank_input, indent=2)}
+    """)
+    r2 = client.messages.create(
+        model=model, max_tokens=2048,
+        messages=[{"role": "user", "content": rerank_prompt}],
+    )
+    raw2 = r2.content[0].text.strip()
+    if raw2.startswith("```"):
+        raw2 = re.sub(r"^```\w*\n?", "", raw2)
+        raw2 = re.sub(r"\n?```$", "", raw2)
+    try:
+        ranked = _json.loads(raw2).get("results", [])
+    except _json.JSONDecodeError:
+        console.print("[yellow]Re-rank parse failed; showing raw candidates.[/yellow]")
+        ranked = [{"id": i, "reason": ""} for i in range(min(n, len(enriched)))]
+
+    console.print(f"\n[bold]Top {min(n, len(ranked))} result(s)[/bold]\n")
+    for rank, item in enumerate(ranked[:n], 1):
+        idx = item.get("id")
+        if not isinstance(idx, int) or idx < 0 or idx >= len(enriched):
+            continue
+        x = enriched[idx]
+        url = _vault_obsidian_url(cfg, Path(x["rel"]))
+        lc_color = _LIFECYCLE_COLORS.get(x["lifecycle"], "white")
+        console.print(
+            f"[bold cyan]{rank}.[/bold cyan] "
+            f"[link={url}]{x['title']}[/link]  "
+            f"[{lc_color}]{x['lifecycle']}[/{lc_color}] "
+            f"[dim]· {x['top']}[/dim]"
+        )
+        if item.get("reason"):
+            console.print(f"   {item['reason']}")
+        console.print(f"   [dim]{url}[/dim]\n")
 
 
 @app.command(rich_help_panel="Utilities")
@@ -2500,7 +3133,7 @@ def organize(
         False, "--dry-run", "-n", help="Preview changes without modifying files"
     ),
     force: bool = typer.Option(False, "--force", help="Run even if already ran today"),
-):
+) -> None:
     """Run the vault organizer to tag and link notes."""
     script = Path(__file__).resolve().parent / "organize.py"
     if not script.exists():
@@ -2516,7 +3149,7 @@ def organize(
 
 
 @app.command(hidden=True)
-def tui():
+def tui() -> None:
     """Launch the TUI workspace control panel in tmux."""
     session = "arc-workspace"
 
