@@ -102,10 +102,28 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | **Review & Ship** | |
 | `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override) |
 | `arc approve <slug>` | Push branch, create PR, and launch CI monitor |
+| **Knowledge** | |
+| `arc search <query>` | Natural-language vault search. Lifecycle/folder filters parsed from the query itself (e.g. "evergreen notes on RAG" or "skip old blog drafts"). Clickable Obsidian links in output. |
+| `arc migrate-lifecycle` | One-shot: tag every vault note with `lifecycle:` + `source_type:` frontmatter. Idempotent. `--dry-run` to preview. |
 | **Utilities** | |
 | `arc init` | Interactive setup — create `config.toml` from prompts |
 | `arc chat <slug>` | Informal Claude chat with project context |
 | `arc organize` | Run the vault organizer (tag & link notes) |
+
+### Knowledge layer
+
+Every note in the vault carries a `lifecycle` and `source_type` in its frontmatter. These drive how `organize.py` treats the note (what it can edit vs. leave alone) and power `arc search`.
+
+**Lifecycle classes:**
+- `live` — active project indexes, current plans. arc auto-refreshes `last_activity`, `last_command`, `open_prs`, and `active_stage` on every `chat / plan / implement / review / approve / sandbox / dev / sync`.
+- `log` — session-log files (`notes.md` under Projects). Append-only; never touched by the organizer.
+- `frozen` — archived project indexes, finished blog drafts. No edits.
+- `evergreen` — authored notes worth re-verifying occasionally (Research, Agents).
+- `reference` — clippings and web-sourced material. Tagged and linked, but bodies are never modified.
+
+**Source types:** `project-meta`, `session-log`, `web-clipping`, `authored`. The `source_type` is permanent — a note clipped from the web keeps `source_type: web-clipping` even if it later moves out of `Clippings/`.
+
+Classification is deterministic by folder + frontmatter; any note with an explicit `lifecycle:` you've set yourself is always preserved.
 
 ### Status lifecycle
 
