@@ -100,7 +100,7 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc editor <slug>` | Open sandbox in VS Code (or Cursor with `--cursor`) with changed files |
 | `arc dev <slug>` | Launch dev server in a background tmux session |
 | **Review & Ship** | |
-| `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override) |
+| `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override). Add `--thorough` for a multi-lens review. |
 | `arc approve <slug>` | Push branch, create PR, and launch CI monitor |
 | **Knowledge** | |
 | `arc search <query>` | Natural-language vault search. Lifecycle/folder filters parsed from the query itself (e.g. "evergreen notes on RAG" or "skip old blog drafts"). Clickable Obsidian links in output. |
@@ -235,6 +235,42 @@ arc review <slug> --tool claude -m claude-sonnet-4-20250514
 
 To change the default, edit `DEFAULT_REVIEW_TOOL` and `DEFAULT_REVIEW_MODEL` near the top of `_run_review()` in `arc.py`.
 
+### Thorough (multi-lens) review
+
+```bash
+arc review <slug> --thorough    # or -T
+```
+
+Instead of one pass, `--thorough` splits the review into independent lens agents that each look at the diff from a different angle. Lens agents run in parallel (headless, approvals bypassed since the sandbox is already an isolated clone), then an interactive synthesis agent merges the findings and walks you through them one-by-one, asking before applying each fix.
+
+**Lenses:**
+- `behavior` — correctness + regression risk (logic paths, boundary conditions, error handling, broken invariants). Runs tests and lint.
+- `tests` — test quality and coverage (meaningful assertions, missing edge cases, flaky patterns)
+- `interface` — public-surface ergonomics (naming, signatures, defaults, docs, discoverability)
+- `security` — auto-added when the diff contains signals like `auth`, `token`, `crypto`, `pickle`, `shell=True`, etc.
+
+**Output:**
+- `<vault>/Projects/<slug>/review/<lens>.md` — each lens's findings
+- `<vault>/Projects/<slug>/review/summary.md` — merged summary written by the synthesis agent. Compound findings (same location flagged by ≥2 lenses) are surfaced first.
+- `<vault>/Projects/<slug>/review/logs/<lens>.log` — raw codex output per lens, for debugging.
+
+**Customizing lens prompts:** each lens is a markdown file in `lenses/` next to `arc.py`. Edit those to adjust methodology, severity bars, or output format — arc loads them at runtime.
+
+**Flow:**
+
+```
+arc review <slug> --thorough
+  → spawn N lens agents in parallel (codex exec, bypassed approvals)
+  → show progress: [✓] behavior (42s) | [·] tests (running) | ...
+  → when all done, spawn synthesis agent (interactive codex)
+  → synthesis writes summary.md, then:
+      For each finding: "Apply this fix? [y/n/e/q]"
+      → y applies + commits one-line per fix
+      → n skips
+      → e expands reasoning
+      → q quits the walkthrough
+```
+
 ### System prompts injected by arc
 
 arc injects system prompts into Claude and Codex at several points. You can customize these to match your team's conventions, coding standards, or review criteria. Each prompt includes project context (title, paths to notes/plans) and task-specific instructions. Agents are told to write session notes to the appropriate `notes.md` and are explicitly told *not* to update status in frontmatter.
@@ -246,6 +282,7 @@ arc injects system prompts into Claude and Codex at several points. You can cust
 | `arc implement --bg` | `_implement_bg()` — writes a `CLAUDE.md` to the sandbox | Autonomous implementation instructions with paths to project note and notes file |
 | `arc implement --bg` | `_implement_bg()` — inline `-p` flag | One-line prompt passed to `claude` CLI in the orchestrator script |
 | `arc review` | `_run_review()` | Code quality review prompt: diff against main, check correctness, run tests/lint, fix issues |
+| `arc review --thorough` | `_run_thorough_review()` + `lenses/*.md` | Multi-lens pipeline: parallel lens agents (behavior, tests, interface, optional security) write to `<project>/review/<lens>.md`, then an interactive synthesis agent merges findings to `summary.md` and walks you through fixes. Prompts live in `lenses/` as markdown. |
 | `arc chat` | `chat()` function | Lightweight context prompt with paths to project note and notes file |
 | `arc approve` (CI fix) | CI monitor script in `approve()` | Instructs Claude to read CI failures, fix them, and push |
 

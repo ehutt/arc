@@ -1510,6 +1510,244 @@ def implement(
 DEFAULT_REVIEW_TOOL = "codex"
 DEFAULT_REVIEW_MODEL = ""  # empty = tool default
 
+# Default lens set for `arc review --thorough`. Security auto-adds when the
+# diff contains signals below.
+DEFAULT_LENSES = ("behavior", "tests", "interface")
+
+SECURITY_SIGNAL_KEYWORDS = (
+    "auth", "authn", "authz", "password", "passwd", "secret", "token",
+    "credential", "api_key", "apikey", "jwt", "session", "cookie",
+    "login", "logout", "permission", "role", "acl",
+    "crypto", "cipher", "hmac", "hash", "encrypt", "decrypt", "sign",
+    "pickle", "yaml.load(", "eval(", "exec(", "shell=true",
+    "sql", "query", "sanitize", "escape",
+)
+
+
+def _arc_script_dir() -> Path:
+    """Return the directory containing arc.py (where `lenses/` lives)."""
+    return Path(__file__).resolve().parent
+
+
+def _load_lens_template(lens: str) -> str:
+    """Read a lens prompt template from `lenses/<lens>.md`."""
+    path = _arc_script_dir() / "lenses" / f"{lens}.md"
+    if not path.exists():
+        raise FileNotFoundError(f"Lens template not found: {path}")
+    return path.read_text()
+
+
+def _detect_security_signals(sandbox_path: Path) -> bool:
+    """Return True if `git diff main` in the sandbox touches security-relevant code."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "main", "--unified=0"],
+            cwd=sandbox_path,
+            capture_output=True,
+            text=True,
+            env=_clean_env(),
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    diff_lower = result.stdout.lower()
+    return any(sig in diff_lower for sig in SECURITY_SIGNAL_KEYWORDS)
+
+
+def _format_prompt(template: str, mapping: dict[str, str]) -> str:
+    """Substitute {key} placeholders in a template without Python str.format
+    (avoids crashes when prompts or notes contain stray braces)."""
+    result = template
+    for key, val in mapping.items():
+        result = result.replace("{" + key + "}", val)
+    return result
+
+
+def _run_lens_subprocess(
+    lens: str,
+    prompt: str,
+    sandbox_path: Path,
+    log_path: Path,
+    tool: str,
+    model: str,
+) -> tuple[str, int, float]:
+    """Run a single lens agent non-interactively. Returns (lens, returncode, elapsed_s)."""
+    start = time.monotonic()
+    if tool == "codex":
+        cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+        if model:
+            cmd += ["-m", model]
+        cmd += ["-C", str(sandbox_path), prompt]
+    else:
+        cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "-p"]
+        if model:
+            cmd += ["--model", model]
+        cmd += [prompt]
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w") as log:
+        result = subprocess.run(
+            cmd,
+            cwd=sandbox_path,
+            env=_clean_env(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+    return lens, result.returncode, time.monotonic() - start
+
+
+def _run_thorough_review(
+    cfg: Config,
+    proj: Project,
+    sandbox_path: Path,
+    tool: str = DEFAULT_REVIEW_TOOL,
+    model: str = DEFAULT_REVIEW_MODEL,
+) -> None:
+    """Multi-lens review: parallel headless lens agents + interactive synthesis."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not proj.folder:
+        console.print(
+            "[red]Thorough review requires a project folder (non-legacy project).[/red]"
+        )
+        raise typer.Exit(1)
+
+    review_dir = proj.folder / "review"
+    review_dir.mkdir(exist_ok=True)
+    logs_dir = review_dir / "logs"
+    logs_dir.mkdir(exist_ok=True)
+
+    # Select lenses
+    lenses = list(DEFAULT_LENSES)
+    if _detect_security_signals(sandbox_path):
+        lenses.append("security")
+        console.print(
+            "[yellow]Security signals detected in diff — adding security lens.[/yellow]"
+        )
+
+    # Gather shared context
+    plans_context = ""
+    if proj.stages:
+        for s in proj.stages:
+            plan_path = stage_plan_path(proj, s)
+            if plan_path.exists() and plan_path.stat().st_size > 0:
+                plans_context += f"\n### Stage {s.id}: {s.name}\n{plan_path.read_text()}\n"
+
+    common_mapping = {
+        "project_title": proj.title,
+        "project_note_path": str(proj.path),
+        "stage_context": "(none)",
+        "plans_context": plans_context.strip() or "(none)",
+        "test_cmd": cfg.test_cmd,
+        "lint_cmd": cfg.lint_cmd,
+    }
+
+    # Clear any existing lens notes so stale findings don't leak into synthesis
+    for lens in lenses:
+        notes_file = review_dir / f"{lens}.md"
+        if notes_file.exists():
+            notes_file.unlink()
+
+    console.print()
+    console.print(
+        f"[bold cyan]Thorough review — {len(lenses)} lenses in parallel: "
+        f"{', '.join(lenses)}[/bold cyan]"
+    )
+    console.print(
+        "[dim]Lens agents run headless with approvals bypassed. "
+        "Synthesis runs interactively and asks before applying any fix.[/dim]"
+    )
+    console.print()
+
+    # Build (lens, prompt, log_path) triples
+    jobs: list[tuple[str, str, Path]] = []
+    for lens in lenses:
+        try:
+            template = _load_lens_template(lens)
+        except FileNotFoundError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1) from e
+        lens_notes_path = review_dir / f"{lens}.md"
+        mapping = {**common_mapping, "lens_notes_path": str(lens_notes_path)}
+        prompt = _format_prompt(template, mapping)
+        log_path = logs_dir / f"{lens}.log"
+        jobs.append((lens, prompt, log_path))
+
+    # Run lenses in parallel
+    with ThreadPoolExecutor(max_workers=len(lenses)) as pool:
+        futures = {
+            pool.submit(
+                _run_lens_subprocess, lens, prompt, sandbox_path, log_path, tool, model
+            ): lens
+            for lens, prompt, log_path in jobs
+        }
+        for fut in as_completed(futures):
+            lens_name = futures[fut]
+            try:
+                name, rc, elapsed = fut.result()
+                marker = "[green]✓[/green]" if rc == 0 else "[red]✗[/red]"
+                notes_file = review_dir / f"{name}.md"
+                wrote = notes_file.exists() and notes_file.stat().st_size > 0
+                wrote_note = "" if wrote else " [yellow](no notes written)[/yellow]"
+                console.print(f"  {marker} {name} ({elapsed:.0f}s){wrote_note}")
+            except Exception as e:  # noqa: BLE001
+                console.print(f"  [red]✗[/red] {lens_name} — error: {e}")
+
+    # Check we have at least one lens's notes
+    written = [lens for lens in lenses if (review_dir / f"{lens}.md").exists()
+               and (review_dir / f"{lens}.md").stat().st_size > 0]
+    if not written:
+        console.print(
+            f"\n[red]No lens produced notes. Check logs at {logs_dir}. "
+            f"Aborting synthesis.[/red]"
+        )
+        raise typer.Exit(1)
+
+    # Interactive synthesis
+    console.print(
+        "\n[bold cyan]Launching interactive synthesis agent.[/bold cyan] "
+        "[dim]It will summarize findings and ask before applying each fix.[/dim]\n"
+    )
+    try:
+        synthesis_template = _load_lens_template("synthesis")
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
+
+    summary_path = review_dir / "summary.md"
+    lens_notes_list = "\n".join(
+        f"- {lens}: {review_dir / f'{lens}.md'}" for lens in written
+    )
+    synthesis_prompt = _format_prompt(
+        synthesis_template,
+        {
+            "project_title": proj.title,
+            "project_note_path": str(proj.path),
+            "lens_notes_list": lens_notes_list,
+            "summary_path": str(summary_path),
+            "test_cmd": cfg.test_cmd,
+            "lint_cmd": cfg.lint_cmd,
+        },
+    )
+
+    if tool == "codex":
+        cmd = ["codex"]
+        if model:
+            cmd += ["-m", model]
+        cmd += ["-C", str(sandbox_path), synthesis_prompt]
+    else:
+        cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
+        if model:
+            cmd += ["--model", model]
+        cmd += [
+            "--system-prompt",
+            synthesis_prompt,
+            "Synthesize lens findings and walk me through fixes.",
+        ]
+
+    subprocess.run(cmd, cwd=sandbox_path, env=_clean_env())
+
+    console.print(f"\n[green]Thorough review complete.[/green] Summary: {summary_path}")
+
 
 def _run_review(
     cfg: Config,
@@ -2279,6 +2517,12 @@ def review(
         "-m",
         help="Model override (e.g. 'gpt-5.3-codex', 'claude-sonnet-4-20250514')",
     ),
+    thorough: bool = typer.Option(
+        False,
+        "--thorough",
+        "-T",
+        help="Multi-lens review: behavior, tests, interface (+security on signals) in parallel, then interactive synthesis.",
+    ),
 ) -> None:
     """Run AI code review on a project sandbox."""
     cfg = load_config()
@@ -2295,7 +2539,10 @@ def review(
     sandbox_path = Path(proj.sandbox)
 
     set_tab_title(f"arc: {project} (review)")
-    _run_review(cfg, proj, sandbox_path, tool=tool, model=model)
+    if thorough:
+        _run_thorough_review(cfg, proj, sandbox_path, tool=tool, model=model)
+    else:
+        _run_review(cfg, proj, sandbox_path, tool=tool, model=model)
     set_tab_title("")
 
     # Post-command: mark the first 'implemented' stage as 'reviewed'
