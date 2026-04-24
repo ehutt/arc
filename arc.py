@@ -3395,6 +3395,24 @@ def organize(
     raise typer.Exit(result.returncode)
 
 
+@app.command(rich_help_panel="Utilities")
+def cleanup(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n", help="Preview changes without moving files"
+    ),
+) -> None:
+    """Move done/archived project folders to the vault archive directory."""
+    script = Path(__file__).resolve().parent / "cleanup.py"
+    if not script.exists():
+        console.print("[red]cleanup.py not found[/red]")
+        raise typer.Exit(1)
+    cmd = [sys.executable, str(script)]
+    if dry_run:
+        cmd.append("--dry-run")
+    result = subprocess.run(cmd)
+    raise typer.Exit(result.returncode)
+
+
 @app.command(hidden=True)
 def tui() -> None:
     """Launch the TUI workspace control panel in tmux."""

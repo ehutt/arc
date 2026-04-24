@@ -109,6 +109,7 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc init` | Interactive setup — create `config.toml` from prompts |
 | `arc chat <slug>` | Informal Claude chat with project context |
 | `arc organize` | Run the vault organizer (tag & link notes) |
+| `arc cleanup` | Move done/archived project folders to vault archive (`--dry-run` to preview) |
 
 ### Knowledge layer
 
@@ -356,6 +357,36 @@ These are optional — arc works without them. They just make it easier to track
 2. **API key**: The organizer looks for `ANTHROPIC_API_KEY` in the environment, then falls back to macOS Keychain (`security find-generic-password -a vault-organize -s ANTHROPIC_API_KEY`). Set whichever is convenient.
 3. **Model**: Configured via `organize.model` in `config.toml`.
 4. **System prompt**: The `SYSTEM_PROMPT` in `organize.py` describes the vault owner as "an AI engineer focused on LLM evaluation." Change this to match the user's domain for better tagging.
+
+### Weekly project cleanup
+
+`cleanup.py` runs independently as a uv inline script. It scans your Projects folder, finds any project with a `done` or `archived` status, and moves the entire project folder into `Projects/Archived/`.
+
+**Manual run:**
+```sh
+arc cleanup --dry-run   # preview what would move
+arc cleanup             # execute
+```
+
+**Scheduling (macOS):** A launchd plist fires every Saturday at 09:00.
+
+```sh
+# Install (one-time):
+launchctl load ~/Library/LaunchAgents/com.elizabethhutton.arc-cleanup.plist
+
+# To change the day or time, edit the plist (Weekday: 0=Sun … 6=Sat), then reload:
+launchctl unload ~/Library/LaunchAgents/com.elizabethhutton.arc-cleanup.plist
+launchctl load   ~/Library/LaunchAgents/com.elizabethhutton.arc-cleanup.plist
+```
+
+**Configuration** (`config.toml`):
+```toml
+[cleanup]
+statuses = ["done", "archived"]   # which statuses trigger archival
+archived_folder = "Archived"      # subfolder within projects_folder
+```
+
+Logs are written to `logs/cleanup-YYYY-MM-DD.log` and `logs/launchd-cleanup.log`.
 
 ## Architecture
 

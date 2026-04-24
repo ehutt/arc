@@ -40,3 +40,10 @@ max_notes_per_run = 20
 
 # Claude model used by the vault organizer
 model = "claude-sonnet-4-20250514"
+
+[cleanup]
+# Project statuses that trigger archival
+statuses = ["done", "archived"]
+
+# Subfolder within projects_folder where archived projects are moved
+archived_folder = "Archived"
