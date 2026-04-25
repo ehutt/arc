@@ -23,9 +23,11 @@ The specific problems arc solves:
 2. arc plan               →  Collect context from Obsidian + GitHub, break into stages
 3. arc sandbox / arc dev  →  Create isolated clone, optionally launch dev server
 4. arc implement          →  Claude implements (interactive or background)
-5. arc review             →  AI code review (Codex or Claude) + human review
-6. arc approve            →  Push, open PR, continuous CI monitor with auto-fix
-7. arc done / arc archive →  Mark complete, clean up sessions
+5. arc review             →  AI code review (Codex or Claude)
+6. arc diff-review        →  Manual diff review in VS Code (Local PR Review extension)
+7. arc address-review     →  AI addresses your manual review comments
+8. arc approve            →  Push, open PR, continuous CI monitor with auto-fix
+9. arc done / arc archive →  Mark complete, clean up sessions
 ```
 
 At any point during a project's lifecycle, you can drop in for human-in-the-loop work:
@@ -101,6 +103,8 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc dev <slug>` | Launch dev server in a background tmux session |
 | **Review & Ship** | |
 | `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override). Add `--thorough` for a multi-lens review. |
+| `arc diff-review <slug>` | Open VS Code with a [Local PR Review](https://marketplace.visualstudio.com/items?itemName=Gururagavendra.local-pr-review) session pre-seeded against the sandbox (base→branch diff with inline-comment gutter). Installs the extension on first run. |
+| `arc address-review <slug>` | Hand the unresolved comments from the diff-review session to Claude/Codex to fix or reply, then mark addressed threads resolved. |
 | `arc approve <slug>` | Push branch, create PR, and launch CI monitor |
 | **Knowledge** | |
 | `arc search <query>` | Natural-language vault search. Lifecycle/folder filters parsed from the query itself (e.g. "evergreen notes on RAG" or "skip old blog drafts"). Clickable Obsidian links in output. |
@@ -415,6 +419,7 @@ Logs are written to `logs/cleanup-YYYY-MM-DD.log` and `logs/launchd-cleanup.log`
 ```
 arc implement  →  Claude writes code  →  you review the diff
 arc review     →  AI code review (codex or claude)
+arc diff-review / arc address-review  →  manual diff review + AI fixup
 arc approve    →  PR + CI monitor  →  auto-fix CI failures  →  merge
 ```
 

@@ -2561,6 +2561,293 @@ def review(
     _refresh_project_activity(cfg, proj, "review")
 
 
+# ---------------------------------------------------------------------------
+# Manual diff review (Local PR Review VS Code extension)
+# ---------------------------------------------------------------------------
+
+LOCAL_PR_REVIEW_EXT = "Gururagavendra.local-pr-review"
+
+
+def _local_review_dir(sandbox_path: Path) -> Path:
+    return sandbox_path / ".vscode" / "local-reviews"
+
+
+def _local_review_comments_path(sandbox_path: Path, source: str, target: str) -> Path:
+    dir_name = f"{source}_{target}".replace("/", "-")
+    return _local_review_dir(sandbox_path) / dir_name / "comments.json"
+
+
+def _ensure_local_pr_review_extension() -> bool:
+    try:
+        result = subprocess.run(["code", "--list-extensions"], capture_output=True, text=True)
+    except FileNotFoundError:
+        console.print("[red]VS Code 'code' CLI not found on PATH.[/red]")
+        return False
+    if LOCAL_PR_REVIEW_EXT.lower() in result.stdout.lower():
+        return True
+    console.print(f"[yellow]Installing VS Code extension {LOCAL_PR_REVIEW_EXT}...[/yellow]")
+    install = subprocess.run(
+        ["code", "--install-extension", LOCAL_PR_REVIEW_EXT],
+        capture_output=True,
+        text=True,
+    )
+    if install.returncode != 0:
+        console.print(f"[red]Install failed: {install.stderr.strip()}[/red]")
+        return False
+    return True
+
+
+def _seed_local_review(sandbox_path: Path, source_branch: str, target_branch: str) -> str:
+    """Pre-populate .vscode/local-reviews/registry.json with an active review."""
+    import json
+    import uuid
+
+    reviews_dir = _local_review_dir(sandbox_path)
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    registry_path = reviews_dir / "registry.json"
+
+    if registry_path.exists():
+        try:
+            registry = json.loads(registry_path.read_text())
+        except Exception:
+            registry = {"version": 1, "reviews": []}
+    else:
+        registry = {"version": 1, "reviews": []}
+
+    def _commit(branch: str) -> str:
+        result = subprocess.run(
+            ["git", "rev-parse", branch],
+            cwd=sandbox_path,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    existing = next(
+        (
+            r
+            for r in registry.get("reviews", [])
+            if r.get("sourceBranch") == source_branch
+            and r.get("targetBranch") == target_branch
+        ),
+        None,
+    )
+    if existing:
+        existing["sourceCommit"] = _commit(source_branch) or existing.get("sourceCommit", "")
+        existing["targetCommit"] = _commit(target_branch) or existing.get("targetCommit", "")
+        review_id = existing["id"]
+    else:
+        review_id = str(uuid.uuid4())
+        registry.setdefault("reviews", []).append(
+            {
+                "id": review_id,
+                "sourceBranch": source_branch,
+                "targetBranch": target_branch,
+                "sourceCommit": _commit(source_branch),
+                "targetCommit": _commit(target_branch),
+                "createdAt": datetime.now().astimezone().isoformat(),
+            }
+        )
+
+    registry["activeReviewId"] = review_id
+    registry["version"] = registry.get("version", 1)
+    registry_path.write_text(json.dumps(registry, indent=2))
+    return review_id
+
+
+def _read_comments_file(comments_path: Path) -> dict | None:
+    import json
+
+    if not comments_path.exists():
+        return None
+    try:
+        return json.loads(comments_path.read_text())
+    except Exception as e:
+        console.print(f"[red]Failed to parse {comments_path}: {e}[/red]")
+        return None
+
+
+@app.command("diff-review", rich_help_panel="Review & Ship")
+def diff_review(
+    project: str = typer.Argument(autocompletion=complete_project),
+    base: str = typer.Option("main", "--base", "-b", help="Base branch to diff against"),
+) -> None:
+    """Open VS Code with a Local PR Review session pre-seeded against the sandbox."""
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    if not proj.sandbox or not Path(proj.sandbox).exists():
+        console.print(f"[red]No sandbox found. Run: arc sandbox {proj.slug}[/red]")
+        raise typer.Exit(1)
+
+    sandbox_path = Path(proj.sandbox)
+
+    if not _ensure_local_pr_review_extension():
+        raise typer.Exit(1)
+
+    subprocess.run(["git", "fetch", "origin", base], cwd=sandbox_path, capture_output=True)
+
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=sandbox_path,
+        capture_output=True,
+        text=True,
+    )
+    compare_branch = head.stdout.strip()
+    if not compare_branch or compare_branch == base:
+        console.print(
+            f"[red]Sandbox is on '{compare_branch or 'unknown'}' — expected a feature branch off {base}.[/red]"
+        )
+        raise typer.Exit(1)
+
+    review_id = _seed_local_review(sandbox_path, base, compare_branch)
+
+    console.print(f"[green]Diff review ready: {base} → {compare_branch}[/green]")
+    console.print(f"[dim]Review id: {review_id}[/dim]")
+    console.print()
+    console.print(
+        "[bold]In VS Code:[/bold] click the Local PR Review icon in the activity bar"
+    )
+    console.print("→ Changed Files → click any file to open the diff")
+    console.print("→ click in the editor gutter to add a comment")
+    console.print()
+    console.print(f"[dim]When done:[/dim] arc address-review {proj.slug}")
+
+    subprocess.run(["code", str(sandbox_path)])
+
+
+@app.command("address-review", rich_help_panel="Review & Ship")
+def address_review(
+    project: str = typer.Argument(autocompletion=complete_project),
+    tool: str = typer.Option(
+        DEFAULT_REVIEW_TOOL, "--tool", "-t", help="Review tool: 'claude' or 'codex'"
+    ),
+    model: str = typer.Option(DEFAULT_REVIEW_MODEL, "--model", "-m", help="Model override"),
+) -> None:
+    """Address unresolved comments from a diff-review session via Claude/Codex."""
+    import json
+
+    cfg = load_config()
+    proj = find_project(cfg, project)
+
+    if tool not in ("claude", "codex"):
+        console.print(f"[red]Unknown tool '{tool}'. Use 'claude' or 'codex'.[/red]")
+        raise typer.Exit(1)
+
+    if not proj.sandbox or not Path(proj.sandbox).exists():
+        console.print(f"[red]No sandbox found. Run: arc sandbox {proj.slug}[/red]")
+        raise typer.Exit(1)
+
+    sandbox_path = Path(proj.sandbox)
+    registry_path = _local_review_dir(sandbox_path) / "registry.json"
+    if not registry_path.exists():
+        console.print(f"[red]No diff review found. Run: arc diff-review {proj.slug}[/red]")
+        raise typer.Exit(1)
+
+    registry = json.loads(registry_path.read_text())
+    active_id = registry.get("activeReviewId")
+    review = next((r for r in registry.get("reviews", []) if r["id"] == active_id), None)
+    if not review:
+        console.print("[red]No active review in registry.[/red]")
+        raise typer.Exit(1)
+
+    comments_path = _local_review_comments_path(
+        sandbox_path, review["sourceBranch"], review["targetBranch"]
+    )
+    data = _read_comments_file(comments_path)
+    if not data or not data.get("threads"):
+        console.print("[yellow]No comments found. Nothing to address.[/yellow]")
+        return
+
+    unresolved = [t for t in data["threads"] if t.get("state") == "unresolved"]
+    if not unresolved:
+        console.print("[green]All comments already resolved.[/green]")
+        return
+
+    sections = []
+    for i, t in enumerate(unresolved, 1):
+        comment_lines = "\n".join(
+            f"  - **{c.get('author', 'reviewer')}**: {c.get('body', '').strip()}"
+            for c in t.get("comments", [])
+        )
+        sections.append(
+            f"### Comment {i} — thread `{t['id']}`\n"
+            f"**File:** `{t['filePath']}` (lines {t['startLine']}-{t['endLine']})\n\n"
+            f"{comment_lines}"
+        )
+    comments_md = "\n\n".join(sections)
+
+    prompt = textwrap.dedent(f"""\
+        You are addressing manual code review comments left by the
+        author of branch `{review["targetBranch"]}` (compared against
+        `{review["sourceBranch"]}`).
+
+        Project: {proj.title}
+        Project note: {proj.path}
+        Comments file: {comments_path}
+
+        ## Your task
+
+        For each comment below, do ONE of:
+        - Fix the code as suggested. Stage and commit only the files
+          you modified with a one-line commit message (no co-authors,
+          no `git add .`).
+        - If the comment is a question, append a reply to the thread
+          in {comments_path}: add an entry to that thread's
+          `comments` array with a unique id, your `body`,
+          `author: "claude"`, and current ISO `timestamp`.
+
+        After addressing each comment (fix or reply), set that
+        thread's `state` to `"resolved"` in {comments_path}. Do NOT
+        delete or reorder threads, do NOT touch already-resolved
+        threads, do NOT modify the project note frontmatter.
+
+        ## Comments to address
+
+        {comments_md}
+    """)
+
+    if tool == "codex":
+        cmd = ["codex"]
+        if model:
+            cmd += ["-m", model]
+        cmd += ["-C", str(sandbox_path), prompt]
+    else:
+        cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
+        if model:
+            cmd += ["--model", model]
+        cmd += ["--system-prompt", prompt, "Address the comments listed above."]
+
+    _set_project_env(proj)
+    set_tab_title(f"arc: {project} (address-review)")
+    console.print(
+        f"[bold cyan]Addressing {len(unresolved)} comment(s) with {tool}...[/bold cyan]"
+    )
+    subprocess.run(cmd, cwd=sandbox_path, env=_clean_env())
+    set_tab_title("")
+
+    after = _read_comments_file(comments_path) or {"threads": []}
+    after_unresolved_ids = {
+        t["id"] for t in after.get("threads", []) if t.get("state") == "unresolved"
+    }
+    addressed = [t for t in unresolved if t["id"] not in after_unresolved_ids]
+    still_open = [t for t in unresolved if t["id"] in after_unresolved_ids]
+
+    console.print()
+    console.print(f"[green]Addressed {len(addressed)}/{len(unresolved)} comment(s).[/green]")
+    if still_open:
+        console.print(f"[yellow]{len(still_open)} comment(s) still unresolved.[/yellow]")
+
+    summary = (
+        f"Addressed {len(addressed)} of {len(unresolved)} manual review "
+        f"comment(s) on {review['targetBranch']}"
+    )
+    proj = find_project(cfg, project)
+    append_session_note(proj, "address-review", summary)
+    update_project_note(proj)
+    _refresh_project_activity(cfg, proj, "address-review")
+
+
 @app.command(rich_help_panel="Development")
 def editor(
     project: str = typer.Argument(autocompletion=complete_project),
