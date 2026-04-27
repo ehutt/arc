@@ -48,7 +48,48 @@ def _find_claude() -> str:
     return "claude"
 
 
+def _find_codex() -> str:
+    """Locate the codex binary, checking nvm paths if not on PATH."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    nvm_dir = os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
+    for node_bin in sorted(Path(nvm_dir, "versions", "node").glob("*/bin/codex"), reverse=True):
+        if node_bin.is_file():
+            return str(node_bin)
+    return "codex"
+
+
 CLAUDE_BIN = _find_claude()
+CODEX_BIN = _find_codex()
+
+
+def _build_agent_cmd(
+    *,
+    use_codex: bool,
+    system_prompt: str,
+    initial_msg: str,
+    cwd: Path | None = None,
+    permission_mode: str | None = None,
+) -> list[str]:
+    """Build an interactive command for claude or codex.
+
+    Codex has no --system-prompt flag for interactive sessions, so the
+    system prompt and initial message are concatenated into a single prompt.
+    permission_mode is claude-only.
+    """
+    if use_codex:
+        combined = f"{system_prompt.rstrip()}\n\n---\n\n{initial_msg}"
+        cmd = [CODEX_BIN]
+        if cwd is not None:
+            cmd += ["-C", str(cwd)]
+        cmd.append(combined)
+        return cmd
+    cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
+    if permission_mode:
+        cmd += ["--permission-mode", permission_mode]
+    cmd += ["--system-prompt", system_prompt, initial_msg]
+    return cmd
 
 
 def _set_project_env(proj: Project) -> None:
@@ -1147,8 +1188,11 @@ def sync() -> None:
 
 
 @app.command(rich_help_panel="Planning")
-def plan(project: str = typer.Argument(autocompletion=complete_project)) -> None:
-    """Launch interactive Claude session to plan a project."""
+def plan(
+    project: str = typer.Argument(autocompletion=complete_project),
+    codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
+) -> None:
+    """Launch interactive planning session (Claude by default, --codex for Codex)."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
@@ -1215,26 +1259,23 @@ def plan(project: str = typer.Argument(autocompletion=complete_project)) -> None
 
     initial_msg = f"Read the project note at {proj.path} and let's plan this project."
 
+    agent_label = "Codex" if codex else "Claude"
     console.print(f"[bold]Launching planning session for: {proj.title}[/bold]")
-    console.print("[dim]Chat with Claude to refine the plan. Exit when done.[/dim]\n")
+    console.print(f"[dim]Chat with {agent_label} to refine the plan. Exit when done.[/dim]\n")
 
     set_tab_title(f"arc: {project} (plan)")
     _set_project_env(proj)
     plan_dir = (
         Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
     )
-    subprocess.run(
-        [
-            CLAUDE_BIN,
-            "--dangerously-skip-permissions",
-            "--permission-mode",
-            "plan",
-            "--system-prompt",
-            system_prompt,
-            initial_msg,
-        ],
+    cmd = _build_agent_cmd(
+        use_codex=codex,
+        system_prompt=system_prompt,
+        initial_msg=initial_msg,
         cwd=plan_dir,
+        permission_mode="plan",
     )
+    subprocess.run(cmd, cwd=plan_dir)
     set_tab_title("")
 
     append_session_note(proj, "plan", f"Planning session for {proj.title}")
@@ -1257,7 +1298,10 @@ def stage_cmd(
     depends_on: str = typer.Option(
         None, "--depends-on", help="Comma-separated stage IDs this depends on"
     ),
-    plan_stage: int = typer.Option(None, "--plan", help="Launch Claude planning for this stage ID"),
+    plan_stage: int = typer.Option(None, "--plan", help="Launch planning for this stage ID"),
+    codex: bool = typer.Option(
+        False, "--codex", help="Use codex instead of claude (with --plan)"
+    ),
 ) -> None:
     """Manage stages for a project."""
     cfg = load_config()
@@ -1330,18 +1374,13 @@ def stage_cmd(
 
         console.print(f"[bold]Planning stage {s.id}: {s.name}[/bold]")
         _set_project_env(proj)
-        os.execvp(
-            CLAUDE_BIN,
-            [
-                CLAUDE_BIN,
-                "--dangerously-skip-permissions",
-                "--permission-mode",
-                "plan",
-                "--system-prompt",
-                system_prompt,
-                initial_msg,
-            ],
+        cmd = _build_agent_cmd(
+            use_codex=codex,
+            system_prompt=system_prompt,
+            initial_msg=initial_msg,
+            permission_mode="plan",
         )
+        os.execvp(cmd[0], cmd)
         return
 
     # Default: list stages
@@ -1479,6 +1518,7 @@ def implement(
     project: str = typer.Argument(autocompletion=complete_project),
     stage_id: int = typer.Argument(None),
     bg: bool = typer.Option(False, "--bg", help="Run autonomously in background (tmux)"),
+    codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
 ) -> None:
     """Implement a project or stage. Interactive by default, --bg for autonomous."""
     cfg = load_config()
@@ -1495,14 +1535,14 @@ def implement(
 
     # --- Background mode: autonomous implement → review pipeline in tmux ---
     if bg:
-        _implement_bg(cfg, proj, sandbox_path)
+        _implement_bg(cfg, proj, sandbox_path, use_codex=codex)
         return
 
     # --- Interactive mode (default) ---
     if proj.stages:
-        _implement_interactive_staged(cfg, proj, sandbox_path, stage_id)
+        _implement_interactive_staged(cfg, proj, sandbox_path, stage_id, use_codex=codex)
     else:
-        _implement_interactive_simple(cfg, proj, sandbox_path)
+        _implement_interactive_simple(cfg, proj, sandbox_path, use_codex=codex)
 
     _refresh_project_activity(cfg, proj, "implement")
 
@@ -1825,7 +1865,11 @@ def _run_review(
 
 
 def _implement_interactive_staged(
-    cfg: Config, proj: Project, sandbox_path: Path, stage_id: int | None
+    cfg: Config,
+    proj: Project,
+    sandbox_path: Path,
+    stage_id: int | None,
+    use_codex: bool = False,
 ) -> None:
     """Interactive implementation of a single stage."""
     # Pick stage
@@ -1909,17 +1953,13 @@ def _implement_interactive_staged(
     set_tab_title(f"arc: {proj.slug} (impl)")
     _set_project_env(proj)
     initial_msg = f"Let's work on stage {stage.id}: {stage.name}"
-    subprocess.run(
-        [
-            CLAUDE_BIN,
-            "--dangerously-skip-permissions",
-            "--system-prompt",
-            system_prompt,
-            initial_msg,
-        ],
+    cmd = _build_agent_cmd(
+        use_codex=use_codex,
+        system_prompt=system_prompt,
+        initial_msg=initial_msg,
         cwd=sandbox_path,
-        env=_clean_env(),
     )
+    subprocess.run(cmd, cwd=sandbox_path, env=_clean_env())
     set_tab_title("")
 
     # Post-command: arc owns the status transition
@@ -1934,7 +1974,9 @@ def _implement_interactive_staged(
     console.print(f"  Review: [bold]arc review {proj.slug}[/bold]")
 
 
-def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path) -> None:
+def _implement_interactive_simple(
+    cfg: Config, proj: Project, sandbox_path: Path, use_codex: bool = False
+) -> None:
     """Interactive implementation for non-staged projects."""
     notes_path = project_notes_path(proj) if proj.folder else None
 
@@ -1965,17 +2007,13 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
 
     set_tab_title(f"arc: {proj.slug} (impl)")
     _set_project_env(proj)
-    subprocess.run(
-        [
-            CLAUDE_BIN,
-            "--dangerously-skip-permissions",
-            "--system-prompt",
-            system_prompt,
-            f"Let's implement {proj.title}.",
-        ],
+    cmd = _build_agent_cmd(
+        use_codex=use_codex,
+        system_prompt=system_prompt,
+        initial_msg=f"Let's implement {proj.title}.",
         cwd=sandbox_path,
-        env=_clean_env(),
     )
+    subprocess.run(cmd, cwd=sandbox_path, env=_clean_env())
     set_tab_title("")
 
     append_session_note(proj, "implement", f"Implementation session for {proj.title}")
@@ -1986,11 +2024,13 @@ def _implement_interactive_simple(cfg: Config, proj: Project, sandbox_path: Path
     console.print(f"  Approve: [bold]arc approve {proj.slug}[/bold]")
 
 
-def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
+def _implement_bg(
+    cfg: Config, proj: Project, sandbox_path: Path, use_codex: bool = False
+) -> None:
     """Autonomous implementation in tmux background."""
     notes_path = project_notes_path(proj) if proj.folder else proj.path
 
-    claude_md = textwrap.dedent(f"""\
+    instructions_md = textwrap.dedent(f"""\
         # Project: {proj.title}
 
         You are implementing this project autonomously. Follow the plan below.
@@ -2015,7 +2055,9 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         ## Project Note
         Read the project note at: {proj.path}
     """)
-    (sandbox_path / "CLAUDE.md").write_text(claude_md)
+    # Codex reads AGENTS.md by convention; Claude reads CLAUDE.md.
+    instructions_filename = "AGENTS.md" if use_codex else "CLAUDE.md"
+    (sandbox_path / instructions_filename).write_text(instructions_md)
 
     # Build export lines for model API keys
     env_exports = ""
@@ -2024,6 +2066,29 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
         if val:
             escaped = val.replace("'", "'\\''")
             env_exports += f"export {key}='{escaped}'\n"
+
+    agent_label = "Codex" if use_codex else "Claude"
+    autonomous_prompt = (
+        f"Read {instructions_filename}. Implement all tasks. Run tests. "
+        "Track your changes with git: after every meaningful change, stage "
+        "ONLY the files you modified (never git add . or git add -A) and "
+        "commit with a simple one-line message (no co-authors). Before "
+        f"finishing, commit any remaining modified files. Write session "
+        f"notes to {notes_path}. NEVER write summary/notes/review files "
+        "into the codebase."
+    )
+    if use_codex:
+        # Escape for embedding in a double-quoted bash string
+        codex_prompt_escaped = autonomous_prompt.replace("\\", "\\\\").replace('"', '\\"')
+        agent_invocation = (
+            f'{CODEX_BIN} exec --dangerously-bypass-approvals-and-sandbox '
+            f'"{codex_prompt_escaped}"'
+        )
+    else:
+        claude_prompt_escaped = autonomous_prompt.replace("\\", "\\\\").replace('"', '\\"')
+        agent_invocation = (
+            f'{CLAUDE_BIN} --dangerously-skip-permissions -p "{claude_prompt_escaped}"'
+        )
 
     orchestrator = textwrap.dedent(f"""\
         #!/bin/bash
@@ -2040,16 +2105,9 @@ def _implement_bg(cfg: Config, proj: Project, sandbox_path: Path) -> None:
           | grep -v -e miniconda -e anaconda -e '\\.venv' \
           | tr '\\n' ':' | sed 's/:$//')
 
-        echo "=== arc: Starting implementation (Claude) for {proj.slug} ==="
+        echo "=== arc: Starting implementation ({agent_label}) for {proj.slug} ==="
 
-        {CLAUDE_BIN} --dangerously-skip-permissions -p "Read CLAUDE.md. \
-Implement all tasks. Run tests. Track your changes with git: \
-after every meaningful change, stage ONLY the files you \
-modified (never git add . or git add -A) and commit with a \
-simple one-line message (no co-authors). Before finishing, \
-commit any remaining modified files. \
-Write session notes to {notes_path}. \
-NEVER write summary/notes/review files into the codebase."
+        {agent_invocation}
 
         osascript -e 'display notification \
 "Implementation complete for {proj.slug}. \
@@ -2456,8 +2514,11 @@ def note_cmd(project: str = typer.Argument(autocompletion=complete_project)) -> 
 
 
 @app.command(rich_help_panel="Utilities")
-def chat(project: str = typer.Argument(autocompletion=complete_project)) -> None:
-    """Launch an informal Claude chat with project context."""
+def chat(
+    project: str = typer.Argument(autocompletion=complete_project),
+    codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
+) -> None:
+    """Launch an informal chat with project context (Claude by default, --codex for Codex)."""
     cfg = load_config()
     proj = find_project(cfg, project)
 
@@ -2481,24 +2542,22 @@ def chat(project: str = typer.Argument(autocompletion=complete_project)) -> None
 
     initial_msg = f"Read the project note at {note_path}"
 
+    agent_label = "Codex" if codex else "Claude"
     console.print(f"[bold]Chatting about: {proj.title}[/bold]")
-    console.print("[dim]Informal Claude session with project context.[/dim]\n")
+    console.print(f"[dim]Informal {agent_label} session with project context.[/dim]\n")
 
     set_tab_title(f"arc: {project} (chat)")
     _set_project_env(proj)
     chat_dir = (
         Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault
     )
-    subprocess.run(
-        [
-            CLAUDE_BIN,
-            "--dangerously-skip-permissions",
-            "--system-prompt",
-            system_prompt,
-            initial_msg,
-        ],
+    cmd = _build_agent_cmd(
+        use_codex=codex,
+        system_prompt=system_prompt,
+        initial_msg=initial_msg,
         cwd=chat_dir,
     )
+    subprocess.run(cmd, cwd=chat_dir)
     set_tab_title("")
 
     append_session_note(proj, "chat", f"Chat session about {proj.title}")

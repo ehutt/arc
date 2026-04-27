@@ -94,11 +94,11 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc done <slug> [stage]` | Mark a stage (or whole project) as done — auto-promotes next stages to `ready`. Use `--skip` to skip instead. |
 | `arc archive <slug>` | Shelve a project without completing it — kills sessions but preserves the sandbox for later. Use when pausing or abandoning work. |
 | **Planning** | |
-| `arc plan <slug>` | Interactive Claude session to plan a project |
-| `arc stage <slug>` | List stages; `--add "name"` to add, `--depends-on 1,2` for deps, `--plan <id>` to plan a stage |
+| `arc plan <slug>` | Interactive planning session (Claude by default; `--codex` for Codex) |
+| `arc stage <slug>` | List stages; `--add "name"` to add, `--depends-on 1,2` for deps, `--plan <id>` to plan a stage (`--codex` for Codex) |
 | **Development** | |
 | `arc sandbox <slug>` | Create an isolated git clone with a feature branch |
-| `arc implement <slug>` | Claude implementation; add `--bg` for autonomous mode in tmux |
+| `arc implement <slug>` | Implementation session; `--bg` for autonomous tmux mode, `--codex` to use Codex instead of Claude |
 | `arc editor <slug>` | Open sandbox in VS Code (or Cursor with `--cursor`) with changed files |
 | `arc dev <slug>` | Launch dev server in a background tmux session |
 | **Review & Ship** | |
@@ -111,7 +111,7 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc migrate-lifecycle` | One-shot: tag every vault note with `lifecycle:` + `source_type:` frontmatter. Idempotent. `--dry-run` to preview. |
 | **Utilities** | |
 | `arc init` | Interactive setup — create `config.toml` from prompts |
-| `arc chat <slug>` | Informal Claude chat with project context |
+| `arc chat <slug>` | Informal chat with project context (Claude by default; `--codex` for Codex) |
 | `arc organize` | Run the vault organizer (tag & link notes) |
 | `arc cleanup` | Move done/archived project folders to vault archive (`--dry-run` to preview) |
 
@@ -227,6 +227,22 @@ arc injects env vars into agent subprocesses in two ways:
 
 3. **`_clean_env()` function**: Strips conda/virtualenv paths from `PATH` before launching agents. This prevents Claude and Codex from seeing the wrong Python environment. If you don't use conda, this is harmless. If you use a different environment manager, you may need to adjust the path filters.
 
+### Choosing Claude vs Codex
+
+The interactive agent commands default to Claude but can use Codex with a `--codex` flag:
+
+```bash
+arc plan <slug> --codex
+arc stage <slug> --plan <id> --codex
+arc chat <slug> --codex
+arc implement <slug> --codex          # interactive
+arc implement <slug> --bg --codex     # autonomous (writes AGENTS.md, runs `codex exec`)
+```
+
+Codex has no `--system-prompt` flag for interactive sessions, so arc concatenates the system prompt and initial message into one combined prompt. For `--bg`, autonomous implementation instructions are written to `AGENTS.md` (Codex convention) instead of `CLAUDE.md`.
+
+`arc review` and `arc address-review` use a separate `--tool {claude,codex}` flag (Codex is the default for those — see below).
+
 ### Customizing the code review
 
 `arc review` defaults to Codex but supports both tools:
@@ -284,8 +300,8 @@ arc injects system prompts into Claude and Codex at several points. You can cust
 |---|---|---|
 | `arc plan` | `plan()` function | Instructs Claude to write a plan; points to project note and vault |
 | `arc implement` (interactive) | `_implement_interactive_simple()` and `_implement_interactive_staged()` | Gives Claude the project context, sandbox path, and git commit instructions. For staged projects, auto-includes `plan.md` and `notes.md` from all dependent stages under a "Prior Stages" section. |
-| `arc implement --bg` | `_implement_bg()` — writes a `CLAUDE.md` to the sandbox | Autonomous implementation instructions with paths to project note and notes file |
-| `arc implement --bg` | `_implement_bg()` — inline `-p` flag | One-line prompt passed to `claude` CLI in the orchestrator script |
+| `arc implement --bg` | `_implement_bg()` — writes a `CLAUDE.md` (or `AGENTS.md` with `--codex`) to the sandbox | Autonomous implementation instructions with paths to project note and notes file |
+| `arc implement --bg` | `_implement_bg()` — inline prompt | One-line prompt passed to `claude` (or `codex exec` with `--codex`) in the orchestrator script |
 | `arc review` | `_run_review()` | Code quality review prompt: diff against main, check correctness, run tests/lint, fix issues |
 | `arc review --thorough` | `_run_thorough_review()` + `lenses/*.md` | Multi-lens pipeline: parallel lens agents (behavior, tests, interface, optional security) write to `<project>/review/<lens>.md`, then an interactive synthesis agent merges findings to `summary.md` and walks you through fixes. Prompts live in `lenses/` as markdown. |
 | `arc chat` | `chat()` function | Lightweight context prompt with paths to project note and notes file |
