@@ -1,6 +1,6 @@
 # arc
 
-A CLI for tracking the arc of AI-assisted projects end-to-end. Each project lives as an Obsidian note with YAML frontmatter; `arc` drives the full lifecycle from GitHub issue to merged PR using Claude for implementation and Codex (or Claude) for code review.
+A CLI for tracking the arc of AI-assisted projects end-to-end. Each project lives as an Obsidian note with YAML frontmatter; `arc` drives the full lifecycle from GitHub issue to merged PR using your coding agent of choice (Claude, Cursor, Codex) for planning, implementation, code review, and informal chatting. 
 
 ## Why
 
@@ -11,8 +11,8 @@ arc is opinionated. It bakes in the development patterns and preferences I've la
 
 The specific problems arc solves:
 
-- **Context management**: Pulls together GitHub issues, Obsidian notes, and repo state into a single project view. Plans, clippings, and related notes are automatically linked and fed to agents as progressively disclosed context.
-- **Parallel development**: Each project gets its own isolated git clone (not a worktree — a full clone), its own feature branch, and optionally its own dev server, all sharing a common local database (my personal preference, ymmv). 
+- **Context management**: Pulls together GitHub issues, Obsidian notes, and repo state into a single project view. Plans, clippings, and related notes are automatically linked and fed to agents as progressively disclosed context. Notes and plans get updated after every conversation.
+- **Parallel development**: Each project gets its own isolated git clone (not a worktree — a lightweight clone), its own feature branch, and optionally its own dev server, all sharing a common local database (my personal preference, ymmv). 
 - **At-a-glance status**: The dashboard shows all active projects — development and non-development — with their current stage, branch, PR status, and running tmux sessions.
 - **Automate the predictable parts**: Code review, CI monitoring, branch management, and PR creation are tedious but mechanical. arc handles them so you can focus on more interesting things without dropping the ball. 
 
@@ -22,17 +22,17 @@ The specific problems arc solves:
 1. arc sync / arc new     →  Pull GitHub issues or create a project from scratch
 2. arc plan               →  Collect context from Obsidian + GitHub, break into stages
 3. arc sandbox / arc dev  →  Create isolated clone, optionally launch dev server
-4. arc implement          →  Claude implements (interactive or background)
-5. arc review             →  AI code review (Codex or Claude)
-6. arc diff-review        →  Manual diff review in VS Code (Local PR Review extension)
-7. arc address-review     →  AI addresses your manual review comments
+4. arc implement          →  Coding agent implements (interactive or background)
+5. arc review             →  AI code review
+6. arc diff-review        →  Manual (human) diff review in VS Code (Local PR Review extension)
+7. arc address-review     →  AI addresses your review comments
 8. arc approve            →  Push, open PR, continuous CI monitor with auto-fix
-9. arc done / arc archive →  Mark complete, clean up sessions
+9. arc done / arc archive →  Mark complete, clean up sessions/sandbox
 ```
 
 At any point during a project's lifecycle, you can drop in for human-in-the-loop work:
 
-- **`arc chat <slug>`** — start a Claude conversation with full project context loaded. Good for brainstorming, asking questions about the codebase, or thinking through a tricky decision without launching a full implementation session.
+- **`arc chat <slug>`** — start a conversation with full project context loaded. Good for brainstorming, asking questions about the codebase, or thinking through a tricky decision without launching a full implementation session.
 - **`arc note <slug>`** — jump straight to the project's Obsidian note. Review plans, check session history, or update the objective.
 - **`arc editor <slug>`** — open the project sandbox in VS Code (or Cursor with `--cursor`) with the changed files pre-loaded, so you can review a diff or make a quick manual edit.
 
@@ -41,10 +41,10 @@ These aren't part of the linear workflow — they're escape hatches for when you
 ## Highlights
 
 - **Not everything needs an agent** — arc makes it easy to jump between Obsidian, VS Code/Cursor, and the terminal. `arc note`, `arc editor`, and the dashboard are quick-nav commands, not AI wrappers.
-- **Separate implementation and review** — use Claude to implement, then Codex (or Claude with a different model) to review. Or skip AI review and review the diff yourself. The steps are decoupled.
+- **Separate implementation and review** — use one model to implement, then another to review. You can configure the model/provider on every command. Or skip AI review and review the diff yourself. The steps are decoupled.
 - **Obsidian as the knowledge layer** — project context, plans, clippings, and related notes all live in your vault. The vault organizer automatically tags and cross-links new notes to active projects.
-- **Project-aware Claude sessions** — the `ARC_PROJECT_SLUG` env var is set before every Claude launch, so your Claude Code status line and hooks can show which project you're working on.
-- **Full clones, not worktrees** — each sandbox is a complete git clone via `--reference`, so you get full isolation with minimal disk cost. Dev servers can run in parallel on different ports sharing a common local database.
+- **Project-aware sessions** — the `ARC_PROJECT_SLUG` env var is set before every Claude launch, so your Claude Code status line and hooks can show which project you're working on.
+- **Lightweight clones, not worktrees** — each sandbox is a complete git clone via `--reference`, so you get full isolation with minimal disk cost. Dev servers can run in parallel on different ports sharing a common local database. You can easily pull from the main branch, and don't have to worry about worktrees. 
 - **CI monitor with auto-fix** — after opening a PR, arc polls CI status and can automatically invoke Claude to fix failures and push.
 
 ## Quick start
