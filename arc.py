@@ -921,12 +921,12 @@ def dashboard(ctx: typer.Context) -> None:
             if len(stage_prs) > 1:
                 nums = []
                 for spr in stage_prs:
-                    m = re.search(r"/pull/(\d+)", spr)
+                    m = re.search(r"/pull/(\d+)", str(spr))
                     if m:
                         nums.append(f"[link={spr}]#{m.group(1)}[/link]")
                 pr_display = " ".join(nums)
             else:
-                pr_url = all_prs[-1]
+                pr_url = str(all_prs[-1])
                 m = re.search(r"/pull/(\d+)", pr_url)
                 if m:
                     pr_display = f"[link={pr_url}]#{m.group(1)}[/link]"
@@ -1411,7 +1411,7 @@ def stage_cmd(
         # PR display
         pr_display = "[dim]—[/dim]"
         if s.github_prs:
-            pr_url = s.github_prs[-1]
+            pr_url = str(s.github_prs[-1])
             pr_match = re.search(r"/pull/(\d+)", pr_url)
             if pr_match:
                 pr_display = f"[link={pr_url}]#{pr_match.group(1)}[/link]"
