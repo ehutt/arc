@@ -2317,8 +2317,11 @@ def approve(
             s.status not in ("done", "skipped") and s.id != approving_stage.id for s in proj.stages
         )
         verb = "Part of" if remaining else "Closes"
+        # github_issues may be YAML ints (e.g. `- 13668`) or strings like
+        # `owner/repo#123`; normalize both to `#<number>` references.
         issue_refs = f"\n\n{verb} " + ", ".join(
-            f"#{ref.split('#')[-1]}" if "#" in ref else ref for ref in proj.github_issues
+            f"#{str(ref).split('#')[-1]}" if "#" in str(ref) or str(ref).isdigit() else str(ref)
+            for ref in proj.github_issues
         )
 
     pr_body = f"{summary}{issue_refs}"
