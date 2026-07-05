@@ -221,9 +221,11 @@ The `arc dev` command launches a dev server in tmux. By default it runs `make de
 
 arc injects env vars into agent subprocesses in two ways:
 
-1. **`MODEL_API_KEYS` list**: API keys carried into tmux sessions and agent subprocesses. Currently: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `KAGGLE_USERNAME`, `KAGGLE_KEY`. Add or remove keys as needed for your setup.
+1. **`MODEL_API_KEYS` list**: API keys carried into tmux sessions and agent subprocesses. Currently: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `ARIZE_API_KEY`, `KAGGLE_USERNAME`, `KAGGLE_KEY`. Add or remove keys as needed for your setup.
 
-2. **`_load_env_keys()` function**: Reads a `.env` file and loads matching keys into `os.environ`. The path is currently `cfg.sandbox_root.parent / "phoenix" / ".env"`. Point this at your repo's `.env` file, or remove it if you set env vars another way.
+2. **`_load_env_keys()` function**: Loads each key from the **macOS Keychain** first (`security find-generic-password -a $USER -s <KEY> -w`), falling back to a `.env` file at `cfg.sandbox_root.parent / "phoenix" / ".env"` for any key not in the Keychain. Store keys with `security add-generic-password -a "$USER" -s <KEY> -w`. Key loading runs before every agent session (`plan`, `chat`, `implement`, `review`, `address-review`, `dev`).
+
+> **Subscription billing guard**: `ANTHROPIC_API_KEY` is always stripped from Claude Code launches (interactive and background) via `_clean_env("claude")` — its presence would silently switch Claude Code from subscription (OAuth) billing to pay-per-token API billing. Codex sessions and non-Claude subprocesses still receive it for code under test. Agents inside a Claude session that need the key can fetch it on demand from the Keychain.
 
 3. **`_clean_env()` function**: Strips conda/virtualenv paths from `PATH` before launching agents. This prevents Claude and Codex from seeing the wrong Python environment. If you don't use conda, this is harmless. If you use a different environment manager, you may need to adjust the path filters.
 
@@ -308,6 +310,8 @@ arc injects system prompts into Claude and Codex at several points. You can cust
 | `arc approve` (CI fix) | CI monitor script in `approve()` | Instructs Claude to read CI failures, fix them, and push |
 
 ### Claude Code integration
+
+**Global project index**: arc writes a compact index of all non-archived projects (slug, status, active stage, branch, sandbox, last activity) to `~/.claude/projects-index.md` on every dashboard run and pipeline command. Reference it from your global agent context file (`@~/.claude/projects-index.md` in `~/.claude/CLAUDE.md`, or symlink that file to `~/.codex/AGENTS.md`) so any agent launched outside arc knows what projects exist and where their notes live.
 
 arc sets the `ARC_PROJECT_SLUG` environment variable before launching Claude sessions. This lets you customize Claude Code's behavior per-project using hooks and the status line.
 
