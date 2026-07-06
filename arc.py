@@ -2852,7 +2852,7 @@ def review(
         False,
         "--debate",
         "-D",
-        help="Adversarial loop: Codex reviews ('assume broken'), Claude fixes or rebuts, until APPROVED.",
+        help="Adversarial loop: Codex reviews, Claude fixes or rebuts, until APPROVED.",
     ),
     rounds: int = typer.Option(5, "--rounds", help="Max debate rounds (with --debate)"),
 ) -> None:
