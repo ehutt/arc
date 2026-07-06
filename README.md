@@ -104,6 +104,7 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc dev <slug>` | Launch dev server in a background tmux session |
 | **Review & Ship** | |
 | `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override). Add `--thorough` for a multi-lens review, or `--debate` for an adversarial Codex-reviews / Claude-fixes loop. |
+| `arc pr-review <number>` | Review **someone else's PR** by number: checks the PR out into a `pr-<n>` sandbox (created on demand), creates a lightweight `pr-review` project, and runs an approval-biased read-only review (`--thorough` / `--debate` supported). Writes a local report ending in `RECOMMENDATION: APPROVE` or `REQUEST-CHANGES`; **never posts to GitHub unless `--comment`**. |
 | `arc diff-review <slug>` | Open VS Code with a [Local PR Review](https://marketplace.visualstudio.com/items?itemName=Gururagavendra.local-pr-review) session pre-seeded against the sandbox (base→branch diff with inline-comment gutter). Installs the extension on first run. |
 | `arc address-review <slug>` | Hand the unresolved comments from the diff-review session to Claude/Codex to fix or reply, then mark addressed threads resolved. |
 | `arc approve <slug>` | Push branch, create PR, and launch CI monitor |
@@ -295,6 +296,24 @@ arc review <slug> --thorough
       → e expands reasoning
       → q quits the walkthrough
 ```
+
+### Reviewing other people's PRs
+
+```bash
+arc pr-review 14054                 # basic read-only review (codex by default)
+arc pr-review 14054 --tool claude   # claude instead
+arc pr-review 14054 --thorough      # multi-lens
+arc pr-review 14054 --debate        # adversarial: Codex attacks, Claude defends
+arc pr-review 14054 --comment       # explicitly opt in to posting the report as a PR comment
+```
+
+Unlike `arc review` (your own work, fixes get committed), `pr-review` is built for reviewing PRs you don't own:
+
+- **Approval-biased posture**: the agent is instructed to default to approval and gate only on serious issues — correctness bugs, data loss, security, breaking API changes, test regressions. Style observations are phrased as optional suggestions.
+- **Strictly read-only**: never modifies the PR's code, never pushes, and never posts comments/reviews/approvals to GitHub. The only exception is an explicit `--comment`, which posts the finished report as a single PR comment.
+- **Self-managing sandbox**: fetches PR metadata via `gh`, clones a `pr-<n>` sandbox from the bare reference repo on first use (reused on re-runs), and `gh pr checkout`s the branch. The diff is taken against the PR's base branch (`git diff origin/<base>...HEAD`).
+- **`--debate` flips the roles**: Codex reviews adversarially, but Claude acts as the *author's defender* — it CONFIRMs or REBUTs each finding with evidence instead of fixing code. What survives both agents is what you gate on.
+- Reports live under `Projects/pr-<n>/review/` in the vault, and each PR gets a lightweight `pr-review`-type project so the dashboard shows what you have in flight.
 
 ### Adversarial debate review
 

@@ -1308,15 +1308,15 @@ def _reconcile_projects(cfg: Config, projects: list[Project], dry_run: bool = Fa
     return changed
 
 
-@app.command(rich_help_panel="Project Management")
+@app.command(rich_help_panel="Scheduled (launchd) — also manual")
 def reconcile(
     dry_run: bool = typer.Option(False, "--dry-run", help="Report drift without writing"),
 ) -> None:
-    """Reconcile vault project state against sandbox git reality.
+    """Reconcile vault project state against sandbox git reality (nightly 07:30).
 
     Git is ground truth: updates branch and last_activity from the sandbox,
     promotes planned projects with commits to active, and lists orphan
-    sandboxes that no project tracks. Safe to run on a schedule.
+    sandboxes that no project tracks. Safe to run manually anytime.
     """
     cfg = load_config()
     projects = load_projects(cfg)
@@ -1797,6 +1797,7 @@ def _run_thorough_review(
     sandbox_path: Path,
     tool: str = DEFAULT_REVIEW_TOOL,
     model: str = DEFAULT_REVIEW_MODEL,
+    extra_context: str = "",
 ) -> None:
     """Multi-lens review: parallel headless lens agents + interactive synthesis."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1831,7 +1832,7 @@ def _run_thorough_review(
     common_mapping = {
         "project_title": proj.title,
         "project_note_path": str(proj.path),
-        "stage_context": "(none)",
+        "stage_context": extra_context or "(none)",
         "plans_context": plans_context.strip() or "(none)",
         "test_cmd": cfg.test_cmd,
         "lint_cmd": cfg.lint_cmd,
@@ -1951,6 +1952,9 @@ def _run_debate_review(
     sandbox_path: Path,
     max_rounds: int = 5,
     model: str = DEFAULT_REVIEW_MODEL,
+    extra_context: str = "",
+    read_only: bool = False,
+    diff_ref: str = "main",
 ) -> None:
     """Adversarial implement/review loop: Codex reviews with an explicit
     'assume it's broken' stance, Claude fixes or rebuts, repeat until Codex
@@ -1958,6 +1962,10 @@ def _run_debate_review(
 
     Handoff is file-based (findings under <project>/review/debate/) — no MCP
     session plumbing, each agent just reads the other's artifact.
+
+    With read_only=True (reviewing someone else's PR), Claude acts as a
+    defender instead of a fixer: it rebuts or confirms findings in the
+    findings file but never modifies code.
     """
     folder = proj.folder if proj.folder else (proj.path.parent if proj.path else None)
     if folder is None:
@@ -1986,8 +1994,8 @@ def _run_debate_review(
 
             Project: {proj.title}
             Project note: {proj.path}
-
-            1. Run `git diff main` to see all changes.
+            {extra_context}
+            1. Run `git diff {diff_ref}` to see all changes.
             2. {prior}Hunt for: logic errors, broken edge cases, incorrect API
                usage, regressions, missing or vacuous tests. Run tests when it
                helps: {cfg.test_cmd}
@@ -2019,22 +2027,42 @@ def _run_debate_review(
             verdict = "APPROVED"
             break
 
-        fixer_prompt = textwrap.dedent(f"""\
-            You are the implementer in an adversarial review loop for
-            project: {proj.title}. An independent reviewer examined your diff
-            against main and wrote findings to: {findings_path}
+        if read_only:
+            fixer_prompt = textwrap.dedent(f"""\
+                You are the defender in an adversarial review of someone
+                else's pull request (project: {proj.title}). An independent
+                reviewer wrote findings to: {findings_path}
+                {extra_context}
+                For EACH finding there, investigate the code and either:
+                - CONFIRM it: append 'CONFIRMED:' under the finding with a
+                  one-line justification of why it is a real, serious issue.
+                - Rebut it: append 'REBUTTAL:' under the finding with concrete
+                  evidence (code paths, test output) showing it is wrong,
+                  already handled, or not serious enough to block a PR.
+                You may run tests read-only: {cfg.test_cmd}
+                Do NOT modify any code, do NOT commit, do NOT post anything to
+                GitHub, do NOT update project frontmatter.
+            """)
+        else:
+            fixer_prompt = textwrap.dedent(f"""\
+                You are the implementer in an adversarial review loop for
+                project: {proj.title}. An independent reviewer examined your
+                diff against {diff_ref} and wrote findings to: {findings_path}
 
-            For EACH finding there:
-            - If it is a real defect: fix it, stage ONLY the files you modified
-              (never `git add .`), and commit with a one-line message.
-            - If it is wrong or not worth fixing: append a short 'REBUTTAL:'
-              paragraph directly under that finding in {findings_path},
-              with concrete evidence (code, test output).
-            Run tests after fixes: {cfg.test_cmd}
-            Do NOT update project frontmatter. Do NOT write summary files into
-            the codebase. Before finishing, commit any remaining modified files.
-        """)
-        console.print(f"[bold cyan]Debate round {rnd}: Claude addressing findings...[/bold cyan]")
+                For EACH finding there:
+                - If it is a real defect: fix it, stage ONLY the files you
+                  modified (never `git add .`), and commit with a one-line
+                  message.
+                - If it is wrong or not worth fixing: append a short
+                  'REBUTTAL:' paragraph directly under that finding in
+                  {findings_path}, with concrete evidence (code, test output).
+                Run tests after fixes: {cfg.test_cmd}
+                Do NOT update project frontmatter. Do NOT write summary files
+                into the codebase. Before finishing, commit any remaining
+                modified files.
+            """)
+        role = "defending" if read_only else "addressing"
+        console.print(f"[bold cyan]Debate round {rnd}: Claude {role} findings...[/bold cyan]")
         subprocess.run(
             [CLAUDE_BIN, "--dangerously-skip-permissions", "-p", fixer_prompt],
             cwd=sandbox_path,
@@ -2898,6 +2926,192 @@ def review(
         append_session_note(proj, "review", f"Code review completed for {proj.title}")
     update_project_note(proj)
     _refresh_project_activity(cfg, proj, "review")
+
+
+@app.command("pr-review", rich_help_panel="Review & Ship")
+def pr_review(
+    pr_number: int = typer.Argument(help="PR number in the configured repo (anyone's PR)"),
+    thorough: bool = typer.Option(False, "--thorough", "-T", help="Multi-lens review"),
+    debate: bool = typer.Option(
+        False, "--debate", "-D", help="Adversarial reviewer/defender loop (read-only)"
+    ),
+    rounds: int = typer.Option(3, "--rounds", help="Max debate rounds (with --debate)"),
+    tool: str = typer.Option(
+        DEFAULT_REVIEW_TOOL, "--tool", "-t", help="Review tool for basic mode"
+    ),
+    model: str = typer.Option(DEFAULT_REVIEW_MODEL, "--model", "-m", help="Model override"),
+    comment: bool = typer.Option(
+        False,
+        "--comment",
+        help="Post the final report as a PR comment. Default: never touches GitHub.",
+    ),
+) -> None:
+    """Review someone else's PR by number.
+
+    Fetches the PR into a pr-<n> sandbox (created on demand), creates a
+    lightweight pr-review project to hold the report, and runs an
+    approval-biased read-only review: default to approve, gate only on
+    serious issues. Never posts to GitHub unless --comment is given.
+    """
+    import json
+
+    cfg = load_config()
+    if debate and thorough:
+        console.print("[red]--debate and --thorough are mutually exclusive.[/red]")
+        raise typer.Exit(1)
+
+    r = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--repo", cfg.github_repo,
+            "--json", "number,title,author,headRefName,baseRefName,url,body",
+        ],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        console.print(f"[red]Could not fetch PR #{pr_number}: {r.stderr.strip()}[/red]")
+        raise typer.Exit(1)
+    pr = json.loads(r.stdout)
+    author = (pr.get("author") or {}).get("login", "?")
+    base = pr.get("baseRefName") or "main"
+    pr_title = pr.get("title", f"PR #{pr_number}")
+    pr_url = pr.get("url", "")
+    console.print(f"[bold]PR #{pr_number}[/bold] {pr_title} [dim]by {author} → {base}[/dim]")
+
+    # Lightweight project to hold review artifacts (reused across runs)
+    slug = f"pr-{pr_number}"
+    proj = next((p for p in load_projects(cfg) if p.slug == slug), None)
+    if proj is None:
+        proj = create_project_note(
+            cfg,
+            f"PR Review: #{pr_number} {pr_title}",
+            slug,
+            body=f"Review of {pr_url} by {author}. arc-managed pr-review project.",
+        )
+        proj.type = "pr-review"
+        proj.status = "active"
+        proj.tags = ["phoenix", "pr-review"]
+        proj.github_prs = [pr_url] if pr_url else []
+
+    # Sandbox: clone on demand, then check out the PR branch
+    sandbox_path = cfg.sandbox_root / slug
+    if not sandbox_path.exists():
+        bare = cfg.bare_repo
+        if bare.exists():
+            subprocess.run(["git", "fetch", "--all"], cwd=bare, capture_output=True)
+            console.print(f"[bold]Cloning to {sandbox_path}...[/bold]")
+            subprocess.run(
+                [
+                    "git", "clone", "--reference", str(bare), "--shared",
+                    f"https://github.com/{cfg.github_repo}.git", str(sandbox_path),
+                ],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                ["git", "clone", f"https://github.com/{cfg.github_repo}.git", str(sandbox_path)],
+                check=True,
+            )
+    else:
+        subprocess.run(["git", "fetch", "origin"], cwd=sandbox_path, capture_output=True)
+    co = subprocess.run(
+        ["gh", "pr", "checkout", str(pr_number), "--repo", cfg.github_repo],
+        cwd=sandbox_path,
+    )
+    if co.returncode != 0:
+        console.print(f"[red]gh pr checkout {pr_number} failed.[/red]")
+        raise typer.Exit(1)
+
+    proj.sandbox = str(sandbox_path)
+    proj.branch = pr.get("headRefName", "")
+    update_project_note(proj)
+
+    diff_ref = f"origin/{base}...HEAD"
+    posture = textwrap.dedent(f"""\
+        ## PR review context
+        You are reviewing SOMEONE ELSE'S pull request: #{pr_number} "{pr_title}"
+        by {author} ({pr_url}), targeting {base}. The full PR diff is
+        `git diff {diff_ref}`.
+
+        Review posture: default to approval. Gate ONLY on serious issues —
+        correctness bugs, data loss, security problems, breaking API changes,
+        test regressions. Do not raise style nits or preference rewrites;
+        phrase minor observations as optional suggestions for the author.
+
+        HARD RULES: do NOT post comments, reviews, or approvals to GitHub.
+        Do NOT push. Do NOT modify the PR's code. Local report only.
+    """)
+
+    review_dir = (proj.folder or sandbox_path) / "review"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    _load_env_keys(cfg)
+    set_tab_title(f"arc: pr-{pr_number} (review)")
+
+    report_path: Path | None = None
+    if debate:
+        _run_debate_review(
+            cfg, proj, sandbox_path,
+            max_rounds=rounds, model=model,
+            extra_context=posture, read_only=True, diff_ref=diff_ref,
+        )
+        debate_dir = review_dir / "debate"
+        round_files = sorted(debate_dir.glob("round-*.md")) if debate_dir.exists() else []
+        report_path = round_files[-1] if round_files else None
+    elif thorough:
+        _run_thorough_review(cfg, proj, sandbox_path, tool=tool, model=model, extra_context=posture)
+        report_path = review_dir / "summary.md"
+    else:
+        report_path = review_dir / f"pr-{pr_number}-review.md"
+        basic_prompt = textwrap.dedent(f"""\
+            {posture}
+            You are reviewing this pull request in an isolated local checkout.
+
+            1. Run `git diff {diff_ref}` to see the full PR diff.
+            2. Read the changed files for surrounding context. Run tests only
+               if the diff warrants it: {cfg.test_cmd}
+            3. Write a review report to {report_path} with:
+               - a 2-3 sentence summary of what the PR does
+               - findings, each marked blocking/non-blocking with file:line
+                 and a concrete rationale
+               - an optional 'Suggestions for the author' section
+            4. End the report with exactly one line:
+               RECOMMENDATION: APPROVE
+               or
+               RECOMMENDATION: REQUEST-CHANGES (serious issues only)
+        """)
+        console.print(f"[bold cyan]Reviewing PR #{pr_number} with {tool}...[/bold cyan]")
+        if tool == "codex":
+            cmd = [CODEX_BIN, "exec", "--dangerously-bypass-approvals-and-sandbox"]
+            if model:
+                cmd += ["-m", model]
+            cmd += ["-C", str(sandbox_path), basic_prompt]
+        else:
+            cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "-p", basic_prompt]
+        subprocess.run(cmd, cwd=sandbox_path, env=_clean_env(tool))
+
+    set_tab_title("")
+    if report_path and report_path.exists():
+        text = report_path.read_text()
+        for line in reversed(text.splitlines()):
+            if line.startswith(("RECOMMENDATION:", "VERDICT:")):
+                console.print(f"\n[bold]{line}[/bold]")
+                break
+        console.print(f"[green]Report:[/green] {report_path}")
+        if comment:
+            console.print(f"[bold cyan]Posting report as comment on PR #{pr_number}...[/bold cyan]")
+            subprocess.run(
+                [
+                    "gh", "pr", "comment", str(pr_number),
+                    "--repo", cfg.github_repo,
+                    "--body-file", str(report_path),
+                ],
+                check=False,
+            )
+    elif comment:
+        console.print("[yellow]No report file produced — nothing posted.[/yellow]")
+
+    append_session_note(proj, "pr-review", f"Reviewed PR #{pr_number} ({pr_title}) by {author}")
+    _refresh_project_activity(cfg, proj, "pr-review")
 
 
 # ---------------------------------------------------------------------------
@@ -4119,14 +4333,14 @@ def search(
         console.print(f"   [dim]{url}[/dim]\n")
 
 
-@app.command(rich_help_panel="Utilities")
+@app.command(rich_help_panel="Scheduled (launchd) — also manual")
 def organize(
     dry_run: bool = typer.Option(
         False, "--dry-run", "-n", help="Preview changes without modifying files"
     ),
     force: bool = typer.Option(False, "--force", help="Run even if already ran today"),
 ) -> None:
-    """Run the vault organizer to tag and link notes."""
+    """Run the vault organizer to tag and link notes (scheduled daily)."""
     script = Path(__file__).resolve().parent / "organize.py"
     if not script.exists():
         console.print("[red]organize.py not found[/red]")
@@ -4140,13 +4354,13 @@ def organize(
     raise typer.Exit(result.returncode)
 
 
-@app.command(rich_help_panel="Utilities")
+@app.command(rich_help_panel="Scheduled (launchd) — also manual")
 def cleanup(
     dry_run: bool = typer.Option(
         False, "--dry-run", "-n", help="Preview changes without moving files"
     ),
 ) -> None:
-    """Move done/archived project folders to the vault archive directory."""
+    """Move done/archived project folders to the vault archive (scheduled Sat 09:00)."""
     script = Path(__file__).resolve().parent / "cleanup.py"
     if not script.exists():
         console.print("[red]cleanup.py not found[/red]")
