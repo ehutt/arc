@@ -1308,6 +1308,66 @@ def _reconcile_projects(cfg: Config, projects: list[Project], dry_run: bool = Fa
     return changed
 
 
+def _retire_merged_pr_reviews(cfg: Config, projects: list[Project], dry_run: bool = False) -> int:
+    """Retire pr-review projects whose PR has merged.
+
+    Marks the project done, kills its tmux sessions, and removes its
+    pr-<n> sandbox (only sandboxes named pr-* under sandbox_root, and only
+    when the clone is clean). The weekly cleanup then archives the folder.
+    """
+    import json
+
+    retired = 0
+    for proj in projects:
+        if proj.type != "pr-review" or proj.status in ("done", "archived"):
+            continue
+        m = re.match(r"^pr-(\d+)$", proj.slug)
+        if not m:
+            continue
+        num = m.group(1)
+        try:
+            r = subprocess.run(
+                ["gh", "pr", "view", num, "--repo", cfg.github_repo, "--json", "state"],
+                capture_output=True, text=True, timeout=15,
+            )
+            state = json.loads(r.stdout).get("state", "") if r.returncode == 0 else ""
+        except (subprocess.SubprocessError, OSError, ValueError):
+            continue
+        if state != "MERGED":
+            continue
+
+        tag = " [dim](dry-run)[/dim]" if dry_run else ""
+        console.print(f"[bold]{proj.slug}[/bold]: PR #{num} merged — retiring{tag}")
+        retired += 1
+        if dry_run:
+            continue
+
+        for sess in (f"arc-{proj.slug}", f"arc-{proj.slug}-ci", f"arc-{proj.slug}-dev"):
+            subprocess.run(["tmux", "kill-session", "-t", sess], capture_output=True)
+
+        if proj.sandbox:
+            sb = Path(proj.sandbox)
+            safe = (
+                sb.exists()
+                and sb.name.startswith("pr-")
+                and sb.resolve().is_relative_to(cfg.sandbox_root.resolve())
+            )
+            if safe:
+                if _git_out(sb, "status", "--porcelain"):
+                    console.print(
+                        f"  [yellow]sandbox has uncommitted changes — left in place: {sb}[/yellow]"
+                    )
+                else:
+                    shutil.rmtree(sb)
+                    proj.sandbox = ""
+                    console.print(f"  removed sandbox {sb}")
+
+        proj.status = "done"
+        proj.last_command = "reconcile (pr merged)"
+        update_project_note(proj)
+    return retired
+
+
 @app.command(rich_help_panel="Scheduled (launchd) — also manual")
 def reconcile(
     dry_run: bool = typer.Option(False, "--dry-run", help="Report drift without writing"),
@@ -1315,12 +1375,14 @@ def reconcile(
     """Reconcile vault project state against sandbox git reality (nightly 07:30).
 
     Git is ground truth: updates branch and last_activity from the sandbox,
-    promotes planned projects with commits to active, and lists orphan
+    promotes planned projects with commits to active, retires pr-review
+    projects whose PR merged (done + sandbox removed), and lists orphan
     sandboxes that no project tracks. Safe to run manually anytime.
     """
     cfg = load_config()
     projects = load_projects(cfg)
     changed = _reconcile_projects(cfg, projects, dry_run=dry_run)
+    changed += _retire_merged_pr_reviews(cfg, projects, dry_run=dry_run)
 
     known = {Path(p.sandbox).resolve() for p in projects if p.sandbox}
     orphans = [

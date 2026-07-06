@@ -314,6 +314,7 @@ Unlike `arc review` (your own work, fixes get committed), `pr-review` is built f
 - **Self-managing sandbox**: fetches PR metadata via `gh`, clones a `pr-<n>` sandbox from the bare reference repo on first use (reused on re-runs), and `gh pr checkout`s the branch. The diff is taken against the PR's base branch (`git diff origin/<base>...HEAD`).
 - **`--debate` flips the roles**: Codex reviews adversarially, but Claude acts as the *author's defender* — it CONFIRMs or REBUTs each finding with evidence instead of fixing code. What survives both agents is what you gate on.
 - Reports live under `Projects/pr-<n>/review/` in the vault, and each PR gets a lightweight `pr-review`-type project so the dashboard shows what you have in flight.
+- **Auto-retirement**: the nightly `arc reconcile` checks each open `pr-review` project against GitHub; once the PR merges, the project is marked `done`, its tmux sessions are killed, and the `pr-<n>` sandbox is deleted (only clean clones named `pr-*` under `sandbox_root` — a dirty clone is left in place with a warning). The weekly cleanup then archives the project folder.
 
 ### Adversarial debate review
 
