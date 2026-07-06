@@ -352,6 +352,8 @@ launchctl load ~/Library/LaunchAgents/com.elizabethhutton.arc-reconcile.plist
 
 Logs: `logs/launchd-reconcile.log`.
 
+**Session-end hooks**: both Claude Code (`~/.claude/settings.json` → SessionEnd) and Codex (`~/.codex/hooks.json` → SessionEnd) run a shared hook script (`~/.claude/hooks/arc-session-end.sh`) when an interactive session ends. The script resolves the project from `ARC_PROJECT_SLUG` (arc-launched sessions) or from the session's cwd being inside `sandbox_root` (sessions launched with plain `claude`/`codex`), then fires `arc reconcile <slug>` in the background. Sessions outside a sandbox are a silent no-op, and teardown never blocks — the reconcile is fire-and-forget with output to `logs/hook-reconcile.log`. The design keeps status **git-derived**: hooks trigger arc; agents still never write frontmatter.
+
 ### System prompts injected by arc
 
 arc injects system prompts into Claude and Codex at several points. You can customize these to match your team's conventions, coding standards, or review criteria. Each prompt includes project context (title, paths to notes/plans) and task-specific instructions. Agents are told to write session notes to the appropriate `notes.md` and are explicitly told *not* to update status in frontmatter.

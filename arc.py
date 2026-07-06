@@ -1370,6 +1370,11 @@ def _retire_merged_pr_reviews(cfg: Config, projects: list[Project], dry_run: boo
 
 @app.command(rich_help_panel="Scheduled (launchd) — also manual")
 def reconcile(
+    project: str = typer.Argument(
+        None,
+        autocompletion=complete_project,
+        help="Reconcile a single project (used by session-end hooks); omit for all",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report drift without writing"),
 ) -> None:
     """Reconcile vault project state against sandbox git reality (nightly 07:30).
@@ -1378,24 +1383,40 @@ def reconcile(
     promotes planned projects with commits to active, retires pr-review
     projects whose PR merged (done + sandbox removed), and lists orphan
     sandboxes that no project tracks. Safe to run manually anytime.
+    Claude/Codex SessionEnd hooks call `arc reconcile <slug>` so vault state
+    updates right after any interactive session, even ones launched outside arc.
     """
     cfg = load_config()
     projects = load_projects(cfg)
+    if project:
+        projects = [
+            p for p in projects
+            if p.slug == project or (p.sandbox and Path(p.sandbox).name == project)
+        ]
+        if not projects:
+            # Hook-safe: sessions in untracked directories are not an error
+            console.print(f"[dim]no tracked project matches '{project}' — nothing to do[/dim]")
+            return
     changed = _reconcile_projects(cfg, projects, dry_run=dry_run)
     changed += _retire_merged_pr_reviews(cfg, projects, dry_run=dry_run)
 
-    known = {Path(p.sandbox).resolve() for p in projects if p.sandbox}
-    orphans = [
-        d for d in sorted(cfg.sandbox_root.iterdir())
-        if d.is_dir() and not d.name.startswith(".") and d.resolve() not in known
-    ]
-    if orphans:
-        console.print(f"\n[yellow]{len(orphans)} sandbox(es) with no tracked project:[/yellow]")
-        for d in orphans:
-            br = _git_out(d, "rev-parse", "--abbrev-ref", "HEAD")
-            ts = _git_out(d, "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d")
-            console.print(f"  {d.name} [dim]({br or '?'}, last commit {ts or '?'})[/dim]")
-        console.print("[dim]Adopt with arc new + sandbox, or delete the clone if abandoned.[/dim]")
+    if not project:
+        known = {Path(p.sandbox).resolve() for p in projects if p.sandbox}
+        orphans = [
+            d for d in sorted(cfg.sandbox_root.iterdir())
+            if d.is_dir() and not d.name.startswith(".") and d.resolve() not in known
+        ]
+        if orphans:
+            console.print(
+                f"\n[yellow]{len(orphans)} sandbox(es) with no tracked project:[/yellow]"
+            )
+            for d in orphans:
+                br = _git_out(d, "rev-parse", "--abbrev-ref", "HEAD")
+                ts = _git_out(d, "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d")
+                console.print(f"  {d.name} [dim]({br or '?'}, last commit {ts or '?'})[/dim]")
+            console.print(
+                "[dim]Adopt with arc new + sandbox, or delete the clone if abandoned.[/dim]"
+            )
 
     if changed == 0:
         console.print("[green]No drift detected.[/green]")
