@@ -387,6 +387,27 @@ def apply_wikilinks(body: str, links: list[dict], logger: logging.Logger) -> str
     return body
 
 
+def append_related_footer(body: str, links: list[dict], logger: logging.Logger) -> str:
+    """Append wikilinks to a '## Related' footer at the end of the note.
+
+    Used for reference notes (clippings): the body stays pristine, but the
+    suggested links still land in the note so Obsidian's graph and backlinks
+    pick them up (instead of being silently discarded).
+    """
+    new_links = []
+    for link in links:
+        target = link.get("target", "")
+        if target and f"[[{target}" not in body:
+            new_links.append(f"- [[{target}]]")
+            logger.info("  +related-link [[%s]]", target)
+    if not new_links:
+        return body
+    footer = "\n".join(new_links)
+    if "## Related" in body:
+        return body.rstrip() + "\n" + footer + "\n"
+    return body.rstrip() + "\n\n## Related\n" + footer + "\n"
+
+
 def append_related_note(
     project_index: Path, note_rel: str, logger: logging.Logger, dry_run: bool
 ) -> None:
@@ -491,19 +512,21 @@ def run(dry_run: bool = False) -> None:
         if tagged:
             new_content = tagged
 
-        # Apply wikilinks to body — only for non-reference notes (clippings stay pristine)
+        # Apply wikilinks: inline for authored notes; '## Related' footer for
+        # reference notes (clippings) so their bodies stay pristine but the
+        # links still reach the graph.
         wikilinks = result.get("wikilinks", [])
-        if wikilinks and note["lifecycle"] != "reference":
+        if wikilinks:
             if new_content:
                 fm_updated, body_updated = split_note(new_content)
-                body_updated = apply_wikilinks(body_updated, wikilinks, logger)
-                new_content = reassemble_note(fm_updated, body_updated)
             else:
-                body_updated = apply_wikilinks(body, wikilinks, logger)
-                if body_updated != body:
-                    new_content = reassemble_note(fm or {}, body_updated)
-        elif wikilinks and note["lifecycle"] == "reference":
-            logger.debug("  skipping %d wikilink(s) — reference note", len(wikilinks))
+                fm_updated, body_updated = (fm or {}), body
+            if note["lifecycle"] == "reference":
+                body_after = append_related_footer(body_updated, wikilinks, logger)
+            else:
+                body_after = apply_wikilinks(body_updated, wikilinks, logger)
+            if body_after != body_updated or new_content:
+                new_content = reassemble_note(fm_updated, body_after)
 
         # Write note
         if new_content and not dry_run:
