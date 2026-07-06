@@ -1198,6 +1198,10 @@ def sync() -> None:
             existing_issues.add(issue_ref)
             console.print(f"  [green]Created project: {slug}[/green]")
 
+    # Reconcile branches from git first so PR matching sees real branch names
+    console.print("\n[bold]Reconciling sandbox state...[/bold]")
+    _reconcile_projects(cfg, projects)
+
     console.print("\n[bold]Checking open PRs...[/bold]")
     result = subprocess.run(
         [
@@ -1235,6 +1239,107 @@ def sync() -> None:
         console.print("  [green]Done[/green]")
 
     console.print("\n[green]Sync complete.[/green]")
+
+
+def _git_out(repo: Path, *args: str) -> str:
+    """Run a git command in repo, returning stdout ('' on any failure)."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def _reconcile_projects(cfg: Config, projects: list[Project], dry_run: bool = False) -> int:
+    """Reconcile vault frontmatter against sandbox git state (git is ground truth).
+
+    Updates branch, last_activity (latest commit wins over stale wall-clock),
+    and promotes planned -> active when feature-branch commits exist.
+    Returns the number of projects changed.
+    """
+    changed = 0
+    for proj in projects:
+        if proj.derived_status in ("archived", "done") or not proj.sandbox:
+            continue
+        sandbox = Path(proj.sandbox)
+        if not sandbox.exists():
+            console.print(
+                f"[yellow]{proj.slug}[/yellow]: sandbox missing ({sandbox}) — "
+                f"run [bold]arc sandbox {proj.slug}[/bold] or clear the field"
+            )
+            continue
+
+        updates: list[str] = []
+        branch = _git_out(sandbox, "rev-parse", "--abbrev-ref", "HEAD")
+        if branch and branch not in ("main", "HEAD") and branch != proj.branch:
+            updates.append(f"branch: {proj.branch or '—'} → {branch}")
+            if not dry_run:
+                proj.branch = branch
+
+        # last_activity: latest commit beats a stale wall-clock timestamp
+        commit_ts = _git_out(sandbox, "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d %H:%M")
+        if commit_ts and commit_ts > (proj.last_activity or ""):
+            updates.append(f"last_activity: {proj.last_activity or '—'} → {commit_ts} (git commit)")
+            if not dry_run:
+                proj.last_activity = commit_ts
+                proj.last_command = "reconcile"
+
+        # planned -> active once real commits exist on a feature branch
+        if proj.status == "planned" and branch and branch != "main":
+            ahead = _git_out(sandbox, "rev-list", "--count", "main..HEAD")
+            if ahead and ahead != "0":
+                updates.append(f"status: planned → active ({ahead} commit(s) on {branch})")
+                if not dry_run:
+                    proj.status = "active"
+
+        if updates:
+            changed += 1
+            tag = " [dim](dry-run)[/dim]" if dry_run else ""
+            console.print(f"[bold]{proj.slug}[/bold]{tag}")
+            for u in updates:
+                console.print(f"  {u}")
+            if _git_out(sandbox, "status", "--porcelain"):
+                console.print("  [dim]note: uncommitted changes in sandbox[/dim]")
+            if not dry_run:
+                update_project_note(proj)
+    return changed
+
+
+@app.command(rich_help_panel="Project Management")
+def reconcile(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report drift without writing"),
+) -> None:
+    """Reconcile vault project state against sandbox git reality.
+
+    Git is ground truth: updates branch and last_activity from the sandbox,
+    promotes planned projects with commits to active, and lists orphan
+    sandboxes that no project tracks. Safe to run on a schedule.
+    """
+    cfg = load_config()
+    projects = load_projects(cfg)
+    changed = _reconcile_projects(cfg, projects, dry_run=dry_run)
+
+    known = {Path(p.sandbox).resolve() for p in projects if p.sandbox}
+    orphans = [
+        d for d in sorted(cfg.sandbox_root.iterdir())
+        if d.is_dir() and not d.name.startswith(".") and d.resolve() not in known
+    ]
+    if orphans:
+        console.print(f"\n[yellow]{len(orphans)} sandbox(es) with no tracked project:[/yellow]")
+        for d in orphans:
+            br = _git_out(d, "rev-parse", "--abbrev-ref", "HEAD")
+            ts = _git_out(d, "log", "-1", "--format=%cd", "--date=format:%Y-%m-%d")
+            console.print(f"  {d.name} [dim]({br or '?'}, last commit {ts or '?'})[/dim]")
+        console.print("[dim]Adopt with arc new + sandbox, or delete the clone if abandoned.[/dim]")
+
+    if changed == 0:
+        console.print("[green]No drift detected.[/green]")
+    elif not dry_run:
+        _write_projects_index(cfg)
+        console.print(f"\n[green]Reconciled {changed} project(s).[/green]")
 
 
 @app.command(rich_help_panel="Planning")
@@ -1838,6 +1943,109 @@ def _run_thorough_review(
     subprocess.run(cmd, cwd=sandbox_path, env=_clean_env(tool))
 
     console.print(f"\n[green]Thorough review complete.[/green] Summary: {summary_path}")
+
+
+def _run_debate_review(
+    cfg: Config,
+    proj: Project,
+    sandbox_path: Path,
+    max_rounds: int = 5,
+    model: str = DEFAULT_REVIEW_MODEL,
+) -> None:
+    """Adversarial implement/review loop: Codex reviews with an explicit
+    'assume it's broken' stance, Claude fixes or rebuts, repeat until Codex
+    issues VERDICT: APPROVED or max_rounds is hit.
+
+    Handoff is file-based (findings under <project>/review/debate/) — no MCP
+    session plumbing, each agent just reads the other's artifact.
+    """
+    folder = proj.folder if proj.folder else (proj.path.parent if proj.path else None)
+    if folder is None:
+        console.print("[red]Project has no folder — cannot store debate findings.[/red]")
+        return
+    debate_dir = folder / "review" / "debate"
+    debate_dir.mkdir(parents=True, exist_ok=True)
+
+    verdict = "NO-VERDICT"
+    rounds_run = 0
+    for rnd in range(1, max_rounds + 1):
+        rounds_run = rnd
+        findings_path = debate_dir / f"round-{rnd}.md"
+        prior = ""
+        if rnd > 1:
+            prior = (
+                f"Prior rounds live in {debate_dir} (round-1.md … round-{rnd - 1}.md). "
+                "Read them first: verify each earlier finding was actually fixed or "
+                "convincingly rebutted (a REBUTTAL section under the finding). "
+                "Re-raise anything unresolved; do not repeat findings that were addressed.\n"
+            )
+        reviewer_prompt = textwrap.dedent(f"""\
+            You are an adversarial code reviewer. Assume the implementation is
+            broken until proven otherwise — your job is to find real defects,
+            not to be agreeable.
+
+            Project: {proj.title}
+            Project note: {proj.path}
+
+            1. Run `git diff main` to see all changes.
+            2. {prior}Hunt for: logic errors, broken edge cases, incorrect API
+               usage, regressions, missing or vacuous tests. Run tests when it
+               helps: {cfg.test_cmd}
+            3. Write your findings to {findings_path} — one section per finding
+               with severity (critical/major/minor), file:line, and a concrete
+               failure scenario (inputs/state → wrong behavior). Report only
+               findings you can defend; no style nits, no speculative rewrites.
+               Do NOT modify any code and do NOT update project frontmatter.
+            4. End the findings file with exactly one line:
+               VERDICT: APPROVED   (nothing worth fixing remains)
+               or
+               VERDICT: REVISE     (fixes needed)
+        """)
+        console.print(
+            f"\n[bold cyan]Debate round {rnd}/{max_rounds}: Codex reviewing...[/bold cyan]"
+        )
+        cmd = [CODEX_BIN, "exec", "--dangerously-bypass-approvals-and-sandbox"]
+        if model:
+            cmd += ["-m", model]
+        cmd += ["-C", str(sandbox_path), reviewer_prompt]
+        subprocess.run(cmd, cwd=sandbox_path, env=_clean_env("codex"))
+
+        text = findings_path.read_text() if findings_path.exists() else ""
+        if not text:
+            console.print("[yellow]Reviewer produced no findings file — stopping.[/yellow]")
+            verdict = "NO-FINDINGS"
+            break
+        if "VERDICT: APPROVED" in text:
+            verdict = "APPROVED"
+            break
+
+        fixer_prompt = textwrap.dedent(f"""\
+            You are the implementer in an adversarial review loop for
+            project: {proj.title}. An independent reviewer examined your diff
+            against main and wrote findings to: {findings_path}
+
+            For EACH finding there:
+            - If it is a real defect: fix it, stage ONLY the files you modified
+              (never `git add .`), and commit with a one-line message.
+            - If it is wrong or not worth fixing: append a short 'REBUTTAL:'
+              paragraph directly under that finding in {findings_path},
+              with concrete evidence (code, test output).
+            Run tests after fixes: {cfg.test_cmd}
+            Do NOT update project frontmatter. Do NOT write summary files into
+            the codebase. Before finishing, commit any remaining modified files.
+        """)
+        console.print(f"[bold cyan]Debate round {rnd}: Claude addressing findings...[/bold cyan]")
+        subprocess.run(
+            [CLAUDE_BIN, "--dangerously-skip-permissions", "-p", fixer_prompt],
+            cwd=sandbox_path,
+            env=_clean_env("claude"),
+        )
+    else:
+        verdict = "MAX-ROUNDS"
+
+    summary = f"Debate review: {verdict} after {rounds_run} round(s). Findings: {debate_dir}"
+    console.print(f"\n[{'green' if verdict == 'APPROVED' else 'yellow'}]{summary}[/]")
+    append_session_note(proj, "review", summary)
 
 
 def _run_review(
@@ -2640,6 +2848,13 @@ def review(
         "-T",
         help="Multi-lens review: behavior, tests, interface (+security on signals) in parallel, then interactive synthesis.",
     ),
+    debate: bool = typer.Option(
+        False,
+        "--debate",
+        "-D",
+        help="Adversarial loop: Codex reviews ('assume broken'), Claude fixes or rebuts, until APPROVED.",
+    ),
+    rounds: int = typer.Option(5, "--rounds", help="Max debate rounds (with --debate)"),
 ) -> None:
     """Run AI code review on a project sandbox."""
     cfg = load_config()
@@ -2647,6 +2862,10 @@ def review(
 
     if tool not in ("claude", "codex"):
         console.print(f"[red]Unknown tool '{tool}'. Use 'claude' or 'codex'.[/red]")
+        raise typer.Exit(1)
+
+    if debate and thorough:
+        console.print("[red]--debate and --thorough are mutually exclusive.[/red]")
         raise typer.Exit(1)
 
     if not proj.sandbox or not Path(proj.sandbox).exists():
@@ -2657,7 +2876,9 @@ def review(
 
     set_tab_title(f"arc: {project} (review)")
     _load_env_keys(cfg)
-    if thorough:
+    if debate:
+        _run_debate_review(cfg, proj, sandbox_path, max_rounds=rounds, model=model)
+    elif thorough:
         _run_thorough_review(cfg, proj, sandbox_path, tool=tool, model=model)
     else:
         _run_review(cfg, proj, sandbox_path, tool=tool, model=model)
@@ -3499,6 +3720,91 @@ def _atomic_write_text(path: Path, content: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, path)
+
+
+@app.command(rich_help_panel="Knowledge")
+def lint() -> None:
+    """Vault health report: schema coverage, status contradictions, orphans, dead links.
+
+    Read-only — reports what needs fixing, never writes.
+    """
+    cfg = load_config()
+    vault = cfg.obsidian_vault
+    skip = {".obsidian", ".trash", "Templates", "Assets"}
+    notes = [
+        p for p in vault.rglob("*.md")
+        if not any(part in skip for part in p.parts)
+    ]
+    console.print(f"[bold]Vault lint[/bold] — {len(notes)} notes\n")
+
+    # 1. Lifecycle schema coverage
+    missing_lc = []
+    for p in notes:
+        try:
+            head = p.read_text(errors="replace")[:600]
+        except OSError:
+            continue
+        if not re.search(r"^lifecycle:", head, re.MULTILINE):
+            missing_lc.append(p)
+    if missing_lc:
+        console.print(f"[yellow]{len(missing_lc)} note(s) missing lifecycle frontmatter[/yellow]")
+        for p in missing_lc[:8]:
+            console.print(f"  {p.relative_to(vault)}")
+        if len(missing_lc) > 8:
+            console.print(f"  [dim]… and {len(missing_lc) - 8} more[/dim]")
+        console.print("  [dim]Fix: arc migrate-lifecycle[/dim]\n")
+    else:
+        console.print("[green]All notes carry lifecycle frontmatter.[/green]\n")
+
+    # 2. Project status contradictions + folders without index.md
+    projects = load_projects(cfg)
+    contradictions = [
+        p for p in projects
+        if p.status not in ("archived", "done") and p.stages and p.status != p.derived_status
+    ]
+    if contradictions:
+        console.print(
+            f"[yellow]{len(contradictions)} project(s) with contradictory status[/yellow]"
+        )
+        for p in contradictions:
+            console.print(f"  {p.slug}: stored '{p.status}' vs derived '{p.derived_status}'")
+        console.print("  [dim]Fix: arc reconcile[/dim]\n")
+    projects_dir = vault / cfg.projects_folder
+    no_index = [
+        d.name for d in sorted(projects_dir.iterdir())
+        if d.is_dir() and d.name != "Archived" and not (d / "index.md").exists()
+    ]
+    if no_index:
+        console.print(f"[yellow]{len(no_index)} project folder(s) without index.md[/yellow]")
+        for name in no_index:
+            console.print(f"  {name}")
+        console.print()
+
+    # 3. Dead wikilinks (target resolves to no note by stem or vault path)
+    stems = {p.stem for p in notes}
+    dead: dict[str, list[str]] = {}
+    for p in notes:
+        try:
+            body = p.read_text(errors="replace")
+        except OSError:
+            continue
+        for target in re.findall(r"\[\[([^\]|#\n]+)", body):
+            target = target.strip()
+            name = target.rsplit("/", 1)[-1]
+            # Skip citation artifacts ([[8]]), attachment embeds ([[img.png]]),
+            # and empty targets — they aren't note links.
+            if not name or name.isdigit() or ("." in name and not name.endswith(".md")):
+                continue
+            if name not in stems and not (vault / f"{target}.md").exists():
+                dead.setdefault(target, []).append(str(p.relative_to(vault)))
+    if dead:
+        console.print(f"[yellow]{len(dead)} dead wikilink target(s)[/yellow]")
+        for target, sources in sorted(dead.items(), key=lambda kv: -len(kv[1]))[:10]:
+            console.print(f"  [[{target}]] [dim]({len(sources)} ref(s), e.g. {sources[0]})[/dim]")
+        if len(dead) > 10:
+            console.print(f"  [dim]… and {len(dead) - 10} more[/dim]")
+    else:
+        console.print("[green]No dead wikilinks.[/green]")
 
 
 @app.command("migrate-lifecycle", rich_help_panel="Utilities")

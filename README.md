@@ -88,7 +88,8 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 |---|---|
 | `arc` | Dashboard: status, stage progress, branches, tmux sessions |
 | **Project Management** | |
-| `arc sync` | Pull GitHub issues and sync PR status from the configured repo |
+| `arc sync` | Pull GitHub issues and sync PR status from the configured repo (reconciles sandbox branches first) |
+| `arc reconcile` | Reconcile vault state against sandbox git reality: branch, last_activity (latest commit), planned→active promotion, orphan-sandbox report. `--dry-run` to preview. Scheduled nightly via launchd. |
 | `arc note <slug>` | Open a project's Obsidian note |
 | `arc new <title>` | Create a new project note without a GitHub issue |
 | `arc done <slug> [stage]` | Mark a stage (or whole project) as done — auto-promotes next stages to `ready`. Use `--skip` to skip instead. |
@@ -102,12 +103,13 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc editor <slug>` | Open sandbox in VS Code (or Cursor with `--cursor`) with changed files |
 | `arc dev <slug>` | Launch dev server in a background tmux session |
 | **Review & Ship** | |
-| `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override). Add `--thorough` for a multi-lens review. |
+| `arc review <slug>` | AI code review (`--tool codex` or `--tool claude`, `--model` to override). Add `--thorough` for a multi-lens review, or `--debate` for an adversarial Codex-reviews / Claude-fixes loop. |
 | `arc diff-review <slug>` | Open VS Code with a [Local PR Review](https://marketplace.visualstudio.com/items?itemName=Gururagavendra.local-pr-review) session pre-seeded against the sandbox (base→branch diff with inline-comment gutter). Installs the extension on first run. |
 | `arc address-review <slug>` | Hand the unresolved comments from the diff-review session to Claude/Codex to fix or reply, then mark addressed threads resolved. |
 | `arc approve <slug>` | Push branch, create PR, and launch CI monitor |
 | **Knowledge** | |
 | `arc search <query>` | Natural-language vault search. Lifecycle/folder filters parsed from the query itself (e.g. "evergreen notes on RAG" or "skip old blog drafts"). Clickable Obsidian links in output. |
+| `arc lint` | Read-only vault health report: notes missing lifecycle frontmatter, project status contradictions, folders without index.md, dead wikilinks. |
 | `arc migrate-lifecycle` | One-shot: tag every vault note with `lifecycle:` + `source_type:` frontmatter. Idempotent. `--dry-run` to preview. |
 | **Utilities** | |
 | `arc init` | Interactive setup — create `config.toml` from prompts |
@@ -294,6 +296,42 @@ arc review <slug> --thorough
       → q quits the walkthrough
 ```
 
+### Adversarial debate review
+
+```bash
+arc review <slug> --debate            # up to 5 rounds (default)
+arc review <slug> --debate --rounds 3
+```
+
+An implement/review loop with the two agents in adversarial roles, using file-based handoff (no MCP session plumbing — each agent reads the other's artifact):
+
+```
+round N:
+  Codex (exec, read-write) reviews `git diff main` with an explicit
+  "assume it's broken" stance → writes findings + VERDICT to
+  <vault>/Projects/<slug>/review/debate/round-N.md
+  → VERDICT: APPROVED  → done
+  → VERDICT: REVISE    → Claude (headless) fixes each finding and commits,
+    or appends a REBUTTAL with evidence under the finding
+  next round: Codex re-checks fixes and rebuttals, re-raises what's unresolved
+```
+
+The loop terminates on APPROVED, a missing findings file, or `--rounds`. The outcome is appended to the project's session notes. Round files are kept for audit.
+
+**Ad-hoc cross-agent consultation**: Codex is also registered as an MCP server in Claude Code (`claude mcp add --scope user codex -- codex mcp-server`), so any Claude session can invoke the `codex` tool directly — useful for second opinions mid-session without a full debate loop.
+
+### Nightly reconcile
+
+Status drift was the biggest real-world failure mode: statuses only moved when arc commands ran, so work done directly in a sandbox (or via a plain `claude` session) never reached the vault. `arc reconcile` treats **git as ground truth**: it updates `branch` from the sandbox's actual HEAD (fixing PR sync matching), advances `last_activity` to the latest commit when it beats the stored wall-clock timestamp, promotes `planned` projects with feature-branch commits to `active`, and lists orphan sandboxes no project tracks. `arc sync` also runs it before PR matching.
+
+A launchd plist runs it nightly at 07:30:
+
+```sh
+launchctl load ~/Library/LaunchAgents/com.elizabethhutton.arc-reconcile.plist
+```
+
+Logs: `logs/launchd-reconcile.log`.
+
 ### System prompts injected by arc
 
 arc injects system prompts into Claude and Codex at several points. You can customize these to match your team's conventions, coding standards, or review criteria. Each prompt includes project context (title, paths to notes/plans) and task-specific instructions. Agents are told to write session notes to the appropriate `notes.md` and are explicitly told *not* to update status in frontmatter.
@@ -375,7 +413,7 @@ These are optional — arc works without them. They just make it easier to track
 
 ### Customizing the vault organizer
 
-`organize.py` runs independently as a uv inline script. It uses Claude to tag notes and link them to projects.
+`organize.py` runs independently as a uv inline script. It uses Claude to tag notes and link them to projects. Authored notes get inline wikilinks; reference notes (clippings) keep pristine bodies but receive suggested links in an appended `## Related` footer, so they still join the Obsidian graph.
 
 1. **Scheduling**: Set up a launchd plist (macOS) or cron job (Linux) to run `uv run --script organize.py` periodically.
 2. **API key**: The organizer looks for `ANTHROPIC_API_KEY` in the environment, then falls back to macOS Keychain (`security find-generic-password -a vault-organize -s ANTHROPIC_API_KEY`). Set whichever is convenient.
