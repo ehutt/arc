@@ -12,6 +12,23 @@ exists. If a project note, PR description, or plan is available, read it for
 intent and acceptance criteria. This skill is a single-pass review, not arc's
 thorough multi-lens/debate workflow.
 
+## Arc project context
+
+When the checkout appears to be managed by arc, recover its project context
+before reviewing:
+
+1. Prefer `ARC_PROJECT_SLUG` when it is set.
+2. Otherwise inspect the current sandbox path, branch name, and `arc` project
+   index to identify the matching project slug.
+3. If the Obsidian vault is discoverable from arc configuration or the global
+   project index, read `Projects/<slug>/index.md` and the project `notes.md`.
+4. Use those notes as requirements, history, and acceptance criteria. Do not
+   edit their frontmatter or session notes during a review.
+
+If no reliable project mapping or vault path can be established, continue with
+the repository, branch, and PR context and state that the arc project notes
+were unavailable. Never guess a project note from a similarly named folder.
+
 Prioritize concrete correctness and regression risks over style. Also look for
 unnecessary complexity, duplicated state, unjustified abstractions, unsafe
 defaults, and interface friction. Trace changed logic through callers, error
