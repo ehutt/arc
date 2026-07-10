@@ -73,6 +73,7 @@ def _build_agent_cmd(
     cwd: Path | None = None,
     permission_mode: str | None = None,
     additional_dirs: list[Path] | None = None,
+    model: str | None = None,
 ) -> list[str]:
     """Build an interactive command for claude or codex.
 
@@ -83,6 +84,8 @@ def _build_agent_cmd(
     if use_codex:
         combined = f"{system_prompt.rstrip()}\n\n---\n\n{initial_msg}"
         cmd = [CODEX_BIN]
+        if model:
+            cmd += ["-m", model]
         if cwd is not None:
             cmd += ["-C", str(cwd)]
         for directory in additional_dirs or []:
@@ -91,6 +94,8 @@ def _build_agent_cmd(
         cmd.append(combined)
         return cmd
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
+    if model:
+        cmd += ["--model", model]
     if permission_mode:
         cmd += ["--permission-mode", permission_mode]
     cmd += ["--system-prompt", system_prompt, initial_msg]
@@ -1448,6 +1453,7 @@ def reconcile(
 def plan(
     project: str = typer.Argument(autocompletion=complete_project),
     codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
+    model: str = typer.Option("", "--model", "-m", help="Model override"),
 ) -> None:
     """Launch interactive planning session (Claude by default, --codex for Codex)."""
     cfg = load_config()
@@ -1532,6 +1538,7 @@ def plan(
         cwd=plan_dir,
         permission_mode="plan",
         additional_dirs=[cfg.obsidian_vault],
+        model=model,
     )
     _load_env_keys(cfg)
     subprocess.run(cmd, cwd=plan_dir, env=_clean_env("codex" if codex else "claude"))
@@ -1561,6 +1568,7 @@ def stage_cmd(
     codex: bool = typer.Option(
         False, "--codex", help="Use codex instead of claude (with --plan)"
     ),
+    model: str = typer.Option("", "--model", "-m", help="Model override (with --plan)"),
 ) -> None:
     """Manage stages for a project."""
     cfg = load_config()
@@ -1640,6 +1648,7 @@ def stage_cmd(
             permission_mode="plan",
             cwd=(Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault),
             additional_dirs=[cfg.obsidian_vault],
+            model=model,
         )
         stage_dir = (
             Path(proj.sandbox)
@@ -1789,6 +1798,7 @@ def implement(
     stage_id: int = typer.Argument(None),
     bg: bool = typer.Option(False, "--bg", help="Run autonomously in background (tmux)"),
     codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
+    model: str = typer.Option("", "--model", "-m", help="Model override"),
 ) -> None:
     """Implement a project or stage. Interactive by default, --bg for autonomous."""
     cfg = load_config()
@@ -1805,14 +1815,14 @@ def implement(
 
     # --- Background mode: autonomous implement → review pipeline in tmux ---
     if bg:
-        _implement_bg(cfg, proj, sandbox_path, use_codex=codex)
+        _implement_bg(cfg, proj, sandbox_path, use_codex=codex, model=model)
         return
 
     # --- Interactive mode (default) ---
     if proj.stages:
-        _implement_interactive_staged(cfg, proj, sandbox_path, stage_id, use_codex=codex)
+        _implement_interactive_staged(cfg, proj, sandbox_path, stage_id, use_codex=codex, model=model)
     else:
-        _implement_interactive_simple(cfg, proj, sandbox_path, use_codex=codex)
+        _implement_interactive_simple(cfg, proj, sandbox_path, use_codex=codex, model=model)
 
     _finish_interactive_session(cfg, proj, "implement")
 
@@ -2271,6 +2281,7 @@ def _implement_interactive_staged(
     sandbox_path: Path,
     stage_id: int | None,
     use_codex: bool = False,
+    model: str = "",
 ) -> None:
     """Interactive implementation of a single stage."""
     # Pick stage
@@ -2360,6 +2371,7 @@ def _implement_interactive_staged(
         initial_msg=initial_msg,
         cwd=sandbox_path,
         additional_dirs=[cfg.obsidian_vault],
+        model=model,
     )
     subprocess.run(cmd, cwd=sandbox_path, env=_clean_env("codex" if use_codex else "claude"))
     set_tab_title("")
@@ -2379,7 +2391,7 @@ def _implement_interactive_staged(
 
 
 def _implement_interactive_simple(
-    cfg: Config, proj: Project, sandbox_path: Path, use_codex: bool = False
+    cfg: Config, proj: Project, sandbox_path: Path, use_codex: bool = False, model: str = ""
 ) -> None:
     """Interactive implementation for non-staged projects."""
     notes_path = project_notes_path(proj) if proj.folder else None
@@ -2417,6 +2429,7 @@ def _implement_interactive_simple(
         initial_msg=f"Let's implement {proj.title}.",
         cwd=sandbox_path,
         additional_dirs=[cfg.obsidian_vault],
+        model=model,
     )
     subprocess.run(cmd, cwd=sandbox_path, env=_clean_env("codex" if use_codex else "claude"))
     set_tab_title("")
@@ -2430,7 +2443,7 @@ def _implement_interactive_simple(
 
 
 def _implement_bg(
-    cfg: Config, proj: Project, sandbox_path: Path, use_codex: bool = False
+    cfg: Config, proj: Project, sandbox_path: Path, use_codex: bool = False, model: str = ""
 ) -> None:
     """Autonomous implementation in tmux background."""
     notes_path = project_notes_path(proj) if proj.folder else proj.path
@@ -2490,12 +2503,15 @@ def _implement_bg(
         codex_prompt_escaped = autonomous_prompt.replace("\\", "\\\\").replace('"', '\\"')
         agent_invocation = (
             f'{CODEX_BIN} exec --dangerously-bypass-approvals-and-sandbox '
+            f'{("-m " + shlex.quote(model) + " ") if model else ""}'
             f'"{codex_prompt_escaped}"'
         )
     else:
         claude_prompt_escaped = autonomous_prompt.replace("\\", "\\\\").replace('"', '\\"')
         agent_invocation = (
-            f'{CLAUDE_BIN} --dangerously-skip-permissions -p "{claude_prompt_escaped}"'
+            f'{CLAUDE_BIN} --dangerously-skip-permissions '
+            f'{("--model " + shlex.quote(model) + " ") if model else ""}'
+            f'-p "{claude_prompt_escaped}"'
         )
 
     orchestrator = textwrap.dedent(f"""\
@@ -2928,6 +2944,7 @@ def note_cmd(project: str = typer.Argument(autocompletion=complete_project)) -> 
 def chat(
     project: str = typer.Argument(autocompletion=complete_project),
     codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
+    model: str = typer.Option("", "--model", "-m", help="Model override"),
 ) -> None:
     """Launch an informal chat with project context (Claude by default, --codex for Codex)."""
     cfg = load_config()
@@ -2968,6 +2985,7 @@ def chat(
         initial_msg=initial_msg,
         cwd=chat_dir,
         additional_dirs=[cfg.obsidian_vault],
+        model=model,
     )
     _load_env_keys(cfg)
     subprocess.run(cmd, cwd=chat_dir, env=_clean_env("codex" if codex else "claude"))
@@ -2980,9 +2998,7 @@ def chat(
 @app.command(rich_help_panel="Review & Ship")
 def review(
     project: str = typer.Argument(autocompletion=complete_project),
-    tool: str = typer.Option(
-        DEFAULT_REVIEW_TOOL, "--tool", "-t", help="Review tool: 'claude' or 'codex'"
-    ),
+    codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
     model: str = typer.Option(
         DEFAULT_REVIEW_MODEL,
         "--model",
@@ -3006,6 +3022,7 @@ def review(
     """Run AI code review on a project sandbox."""
     cfg = load_config()
     proj = find_project(cfg, project)
+    tool = "codex" if codex else "claude"
 
     if tool not in ("claude", "codex"):
         console.print(f"[red]Unknown tool '{tool}'. Use 'claude' or 'codex'.[/red]")
@@ -3055,9 +3072,7 @@ def pr_review(
         False, "--debate", "-D", help="Adversarial reviewer/defender loop (read-only)"
     ),
     rounds: int = typer.Option(3, "--rounds", help="Max debate rounds (with --debate)"),
-    tool: str = typer.Option(
-        DEFAULT_REVIEW_TOOL, "--tool", "-t", help="Review tool for basic mode"
-    ),
+    codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
     model: str = typer.Option(DEFAULT_REVIEW_MODEL, "--model", "-m", help="Model override"),
     comment: bool = typer.Option(
         False,
@@ -3075,9 +3090,7 @@ def pr_review(
     import json
 
     cfg = load_config()
-    if tool not in ("claude", "codex"):
-        console.print(f"[red]Unknown tool '{tool}'. Use 'claude' or 'codex'.[/red]")
-        raise typer.Exit(1)
+    tool = "codex" if codex else "claude"
     if debate and thorough:
         console.print("[red]--debate and --thorough are mutually exclusive.[/red]")
         raise typer.Exit(1)
@@ -3401,9 +3414,7 @@ def diff_review(
 @app.command("address-review", rich_help_panel="Review & Ship")
 def address_review(
     project: str = typer.Argument(autocompletion=complete_project),
-    tool: str = typer.Option(
-        DEFAULT_REVIEW_TOOL, "--tool", "-t", help="Review tool: 'claude' or 'codex'"
-    ),
+    codex: bool = typer.Option(False, "--codex", help="Use codex instead of claude"),
     model: str = typer.Option(DEFAULT_REVIEW_MODEL, "--model", "-m", help="Model override"),
 ) -> None:
     """Address unresolved comments from a diff-review session via Claude/Codex."""
@@ -3411,6 +3422,7 @@ def address_review(
 
     cfg = load_config()
     proj = find_project(cfg, project)
+    tool = "codex" if codex else "claude"
 
     if tool not in ("claude", "codex"):
         console.print(f"[red]Unknown tool '{tool}'. Use 'claude' or 'codex'.[/red]")
