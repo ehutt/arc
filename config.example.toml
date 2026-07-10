@@ -31,6 +31,11 @@ test_cmd = "pytest tests/"
 # Shell command to run linting in the sandbox
 lint_cmd = "make lint"
 
+[dev]
+# Optional non-secret environment file sourced before every `arc dev` launch.
+# If set, arc refuses to launch when the file is missing.
+env_file = "~/Projects/my-repo/.env"
+
 [organize]
 # Folders in the vault to skip during daily organization
 skip_folders = ["Templates", ".obsidian", "Assets"]

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -71,6 +72,7 @@ def _build_agent_cmd(
     initial_msg: str,
     cwd: Path | None = None,
     permission_mode: str | None = None,
+    additional_dirs: list[Path] | None = None,
 ) -> list[str]:
     """Build an interactive command for claude or codex.
 
@@ -83,6 +85,9 @@ def _build_agent_cmd(
         cmd = [CODEX_BIN]
         if cwd is not None:
             cmd += ["-C", str(cwd)]
+        for directory in additional_dirs or []:
+            if directory.exists() and cwd is not None and directory.resolve() != cwd.resolve():
+                cmd += ["--add-dir", str(directory)]
         cmd.append(combined)
         return cmd
     cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
@@ -182,6 +187,7 @@ class Config:
     github_repo: str
     test_cmd: str
     lint_cmd: str
+    dev_env_file: Path | None = None
 
     @property
     def projects_dir(self) -> Path:
@@ -199,6 +205,7 @@ def load_config() -> Config:
         raise typer.Exit(1)
     with open(config_path, "rb") as f:
         raw = tomllib.load(f)
+    dev_env_file_raw = raw.get("dev", {}).get("env_file")
     return Config(
         obsidian_vault=Path(raw["core"]["obsidian_vault"]).expanduser(),
         projects_folder=raw["core"]["projects_folder"],
@@ -208,6 +215,7 @@ def load_config() -> Config:
         github_repo=raw["github"]["repo"],
         test_cmd=raw["agent"]["test_cmd"],
         lint_cmd=raw["agent"]["lint_cmd"],
+        dev_env_file=Path(dev_env_file_raw).expanduser() if dev_env_file_raw else None,
     )
 
 
@@ -401,7 +409,7 @@ class Project:
                         "--head", br,
                         "--state", "open",
                         "--repo", cfg.github_repo,
-                        "--json", "number,title",
+                        "--json", "number,title,url",
                     ],
                     capture_output=True, text=True, timeout=8,
                 )
@@ -412,7 +420,9 @@ class Project:
                         if n in seen:
                             continue
                         seen.add(n)
-                        open_prs.append(f"{cfg.github_repo}#{n} {pr.get('title', '')}")
+                        # Keep github_prs canonical: dashboard and downstream
+                        # tools expect URLs, not display strings.
+                        open_prs.append(pr.get("url") or f"https://github.com/{cfg.github_repo}/pull/{n}")
             except (subprocess.SubprocessError, OSError, ValueError):
                 pass
         self.open_prs = open_prs
@@ -438,6 +448,15 @@ def _refresh_project_activity(cfg: "Config", proj: "Project | None", command: st
     except Exception as e:
         console.print(f"[dim]activity refresh skipped: {e}[/dim]")
     _write_projects_index(cfg)
+
+
+def _finish_interactive_session(cfg: "Config", proj: "Project", command: str) -> None:
+    """Reconcile git/frontmatter after any interactive agent session."""
+    # Reload first: the agent may have edited the note while it was running.
+    current = find_project(cfg, proj.slug)
+    _reconcile_projects(cfg, [current])
+    refreshed = find_project(cfg, proj.slug)
+    _refresh_project_activity(cfg, refreshed, command)
 
 
 def _write_projects_index(cfg: "Config") -> None:
@@ -1512,6 +1531,7 @@ def plan(
         initial_msg=initial_msg,
         cwd=plan_dir,
         permission_mode="plan",
+        additional_dirs=[cfg.obsidian_vault],
     )
     _load_env_keys(cfg)
     subprocess.run(cmd, cwd=plan_dir, env=_clean_env("codex" if codex else "claude"))
@@ -1527,7 +1547,7 @@ def plan(
         auto_promote_ready(proj)
         ensure_stage_folders(proj)
     update_project_note(proj)
-    _refresh_project_activity(cfg, proj, "plan")
+    _finish_interactive_session(cfg, proj, "plan")
 
 
 @app.command("stage", rich_help_panel="Planning")
@@ -1618,8 +1638,19 @@ def stage_cmd(
             system_prompt=system_prompt,
             initial_msg=initial_msg,
             permission_mode="plan",
+            cwd=(Path(proj.sandbox) if proj.sandbox and Path(proj.sandbox).exists() else cfg.obsidian_vault),
+            additional_dirs=[cfg.obsidian_vault],
         )
-        os.execvp(cmd[0], cmd)
+        stage_dir = (
+            Path(proj.sandbox)
+            if proj.sandbox and Path(proj.sandbox).exists()
+            else cfg.obsidian_vault
+        )
+        _set_project_env(proj)
+        _load_env_keys(cfg)
+        subprocess.run(cmd, cwd=stage_dir, env=_clean_env("codex" if codex else "claude"))
+        append_session_note(proj, "plan", f"Planning session for stage {s.id}: {s.name}", stage=s)
+        _finish_interactive_session(cfg, proj, "stage-plan")
         return
 
     # Default: list stages
@@ -1783,7 +1814,7 @@ def implement(
     else:
         _implement_interactive_simple(cfg, proj, sandbox_path, use_codex=codex)
 
-    _refresh_project_activity(cfg, proj, "implement")
+    _finish_interactive_session(cfg, proj, "implement")
 
 
 DEFAULT_REVIEW_TOOL = "codex"
@@ -2013,7 +2044,7 @@ def _run_thorough_review(
         cmd = ["codex"]
         if model:
             cmd += ["-m", model]
-        cmd += ["-C", str(sandbox_path), synthesis_prompt]
+        cmd += ["-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), synthesis_prompt]
     else:
         cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
         if model:
@@ -2222,7 +2253,7 @@ def _run_review(
         cmd = ["codex"]
         if model:
             cmd += ["-m", model]
-        cmd += ["-C", str(sandbox_path), review_prompt]
+        cmd += ["-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), review_prompt]
     else:
         cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
         if model:
@@ -2328,6 +2359,7 @@ def _implement_interactive_staged(
         system_prompt=system_prompt,
         initial_msg=initial_msg,
         cwd=sandbox_path,
+        additional_dirs=[cfg.obsidian_vault],
     )
     subprocess.run(cmd, cwd=sandbox_path, env=_clean_env("codex" if use_codex else "claude"))
     set_tab_title("")
@@ -2339,6 +2371,8 @@ def _implement_interactive_staged(
     stage.status = "implemented"
     auto_promote_ready(proj)
     update_project_note(proj)
+
+    _finish_interactive_session(cfg, proj, "implement")
 
     console.print(f"[green]Stage {stage.id} marked implemented.[/green]")
     console.print(f"  Review: [bold]arc review {proj.slug}[/bold]")
@@ -2382,6 +2416,7 @@ def _implement_interactive_simple(
         system_prompt=system_prompt,
         initial_msg=f"Let's implement {proj.title}.",
         cwd=sandbox_path,
+        additional_dirs=[cfg.obsidian_vault],
     )
     subprocess.run(cmd, cwd=sandbox_path, env=_clean_env("codex" if use_codex else "claude"))
     set_tab_title("")
@@ -2932,13 +2967,14 @@ def chat(
         system_prompt=system_prompt,
         initial_msg=initial_msg,
         cwd=chat_dir,
+        additional_dirs=[cfg.obsidian_vault],
     )
     _load_env_keys(cfg)
     subprocess.run(cmd, cwd=chat_dir, env=_clean_env("codex" if codex else "claude"))
     set_tab_title("")
 
     append_session_note(proj, "chat", f"Chat session about {proj.title}")
-    _refresh_project_activity(cfg, proj, "chat")
+    _finish_interactive_session(cfg, proj, "chat")
 
 
 @app.command(rich_help_panel="Review & Ship")
@@ -3008,7 +3044,7 @@ def review(
     else:
         append_session_note(proj, "review", f"Code review completed for {proj.title}")
     update_project_note(proj)
-    _refresh_project_activity(cfg, proj, "review")
+    _finish_interactive_session(cfg, proj, "review")
 
 
 @app.command("pr-review", rich_help_panel="Review & Ship")
@@ -3039,6 +3075,9 @@ def pr_review(
     import json
 
     cfg = load_config()
+    if tool not in ("claude", "codex"):
+        console.print(f"[red]Unknown tool '{tool}'. Use 'claude' or 'codex'.[/red]")
+        raise typer.Exit(1)
     if debate and thorough:
         console.print("[red]--debate and --thorough are mutually exclusive.[/red]")
         raise typer.Exit(1)
@@ -3162,14 +3201,21 @@ def pr_review(
                or
                RECOMMENDATION: REQUEST-CHANGES (serious issues only)
         """)
-        console.print(f"[bold cyan]Reviewing PR #{pr_number} with {tool}...[/bold cyan]")
-        if tool == "codex":
-            cmd = [CODEX_BIN, "exec", "--dangerously-bypass-approvals-and-sandbox"]
-            if model:
-                cmd += ["-m", model]
-            cmd += ["-C", str(sandbox_path), basic_prompt]
-        else:
-            cmd = [CLAUDE_BIN, "--dangerously-skip-permissions", "-p", basic_prompt]
+        console.print(f"[bold cyan]Reviewing PR #{pr_number} interactively with {tool}...[/bold cyan]")
+        cmd = _build_agent_cmd(
+            use_codex=tool == "codex",
+            system_prompt=basic_prompt,
+            initial_msg="Review this PR interactively, then write the report to the requested path.",
+            cwd=sandbox_path,
+            additional_dirs=[cfg.obsidian_vault],
+        )
+        if model:
+            if tool == "codex":
+                cmd.insert(1, "-m")
+                cmd.insert(2, model)
+            else:
+                cmd.insert(2, "--model")
+                cmd.insert(3, model)
         subprocess.run(cmd, cwd=sandbox_path, env=_clean_env(tool))
 
     set_tab_title("")
@@ -3194,7 +3240,7 @@ def pr_review(
         console.print("[yellow]No report file produced — nothing posted.[/yellow]")
 
     append_session_note(proj, "pr-review", f"Reviewed PR #{pr_number} ({pr_title}) by {author}")
-    _refresh_project_activity(cfg, proj, "pr-review")
+    _finish_interactive_session(cfg, proj, "pr-review")
 
 
 # ---------------------------------------------------------------------------
@@ -3447,7 +3493,7 @@ def address_review(
         cmd = ["codex"]
         if model:
             cmd += ["-m", model]
-        cmd += ["-C", str(sandbox_path), prompt]
+        cmd += ["-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), prompt]
     else:
         cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
         if model:
@@ -3482,7 +3528,7 @@ def address_review(
     proj = find_project(cfg, project)
     append_session_note(proj, "address-review", summary)
     update_project_note(proj)
-    _refresh_project_activity(cfg, proj, "address-review")
+    _finish_interactive_session(cfg, proj, "address-review")
 
 
 @app.command(rich_help_panel="Development")
@@ -3546,6 +3592,14 @@ MODEL_API_KEYS = [
     "ARIZE_API_KEY",
     "KAGGLE_USERNAME",
     "KAGGLE_KEY",
+]
+
+# Secrets made available to the Phoenix dev server. Values are resolved by the
+# launch script directly from macOS Keychain so they are never serialized into
+# the script or tmux's stored environment.
+DEV_API_KEYS = [
+    *MODEL_API_KEYS,
+    "PHOENIX_AGENTS_COLLECTOR_API_KEY",
 ]
 
 # Phoenix cloud vars to unset for local dev
@@ -3618,8 +3672,9 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     sandbox_path = Path(proj.sandbox)
     set_tab_title(f"arc: {project} (dev)")
 
-    # Source model API keys from main phoenix .env
-    _load_env_keys(cfg)
+    if cfg.dev_env_file is not None and not cfg.dev_env_file.is_file():
+        console.print(f"[red]Configured dev env file not found: {cfg.dev_env_file}[/red]")
+        raise typer.Exit(1)
 
     # Unset cloud-targeting vars
     for var in PHOENIX_CLOUD_VARS:
@@ -3752,11 +3807,26 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     dev_log = Path(f"/tmp/arc-dev-{proj.slug}.log")
     dev_script = Path(f"/tmp/arc-dev-{proj.slug}.sh")
     lines = ["#!/usr/bin/env bash"]
-    for key in MODEL_API_KEYS:
-        val = os.environ.get(key, "")
-        if val:
-            escaped = val.replace("'", "'\\''")
-            lines.append(f"export {key}='{escaped}'")
+    if cfg.dev_env_file is not None:
+        lines.extend(
+            [
+                "set -a",
+                f"source {shlex.quote(str(cfg.dev_env_file))}",
+                "set +a",
+            ]
+        )
+    dev_api_keys = " ".join(shlex.quote(key) for key in DEV_API_KEYS)
+    lines.extend(
+        [
+            f"for key in {dev_api_keys}; do",
+            '  if value="$(/usr/bin/security find-generic-password '
+            '-a "$USER" -s "$key" -w 2>/dev/null)"; then',
+            '    export "$key=$value"',
+            "  fi",
+            "done",
+            "unset key value",
+        ]
+    )
     for var in PHOENIX_CLOUD_VARS:
         lines.append(f"unset {var}")
     lines.append(f'export PHOENIX_WORKING_DIR="{Path.home() / ".phoenix"}"')
