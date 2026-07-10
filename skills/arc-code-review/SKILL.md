@@ -1,44 +1,55 @@
 ---
 name: arc-code-review
-description: Perform a rigorous multi-perspective code review of the current sandbox or checkout. Use when reviewing a change, PR, branch, or diff and looking for behavior regressions, test gaps, interface/ergonomics problems, security risks, or a synthesis of findings.
+description: Perform a focused single-pass code review of the current sandbox or checkout. Use when reviewing a change, PR, branch, or diff for correctness, robustness, simplification, ergonomics, interface quality, test gaps, and security risks. This is the portable normal review; arc's thorough multi-lens review remains arc-only.
 ---
 
 # Arc code review
 
 Review the current checkout or the repository and change set named by the
 user. Work from the current working directory; do not assume an arc project
-note or a Phoenix repository exists. If a project note, PR description, or
-plan is available, read it for intent and acceptance criteria.
+note, Phoenix repository, configured test command, or named default branch
+exists. If a project note, PR description, or plan is available, read it for
+intent and acceptance criteria. This skill is a single-pass review, not arc's
+thorough multi-lens/debate workflow.
 
-Choose the perspectives that fit the request. For a full review, cover
-behavior, tests, interface/ergonomics, and security when relevant. For a
-focused review, use only the requested perspective.
-
-Detailed perspective prompts are available in `references/behavior.md`,
-`references/tests.md`, `references/interface.md`, and
-`references/security.md`. The synthesis guidance is in
-`references/synthesis.md`; read the relevant files when producing a structured
-multi-agent-style review.
-
-Prioritize concrete correctness and regression risks over style. Trace changed
-logic through callers, error paths, boundaries, persistence, concurrency, and
-backward compatibility. Report file and line locations, a reproducible failure
-scenario, severity, and a practical fix. Do not modify source code, commit,
-push, post review comments, or update project metadata unless the user
-explicitly asks for implementation after the review.
+Prioritize concrete correctness and regression risks over style. Also look for
+unnecessary complexity, duplicated state, unjustified abstractions, unsafe
+defaults, and interface friction. Trace changed logic through callers, error
+paths, boundaries, persistence, concurrency, and backward compatibility.
+Report file and line locations, a reproducible failure scenario, severity, and
+a practical fix. Do not modify source code, commit, push, post review
+comments, or update project metadata. If the user later asks to implement a
+finding, treat that as a separate request.
 
 ## Review workflow
 
 1. Establish the change set (`git status`, `git diff`, and the relevant base
-   branch or PR diff).
+   branch or PR diff). Prefer an explicit PR/base supplied by the user, then
+   `origin/HEAD`, then the current branch's merge-base; never assume `main`.
 2. Read relevant project requirements, plans, and surrounding callers.
 3. Inspect behavior and regression risks.
-4. Check tests and test coverage; run focused tests when practical.
-5. Check interface and ergonomics, including public API compatibility.
+4. Check tests and test coverage; run the smallest relevant focused tests when
+   practical. Do not run an entire repository suite unless it is clearly small
+   or the user asks for it.
+5. Check interface and ergonomics, including public API compatibility,
+   discoverability, naming, defaults, error messages, and safe paths.
 6. Check security, authorization, secrets, validation, injection, and data
    exposure when the change touches those areas.
-7. Return a concise report with findings first, then tests run and residual
+7. Return a concise report with findings first, then verification and residual
    questions.
+
+## Evidence standard
+
+- Do not report a concern without a concrete trigger → consequence chain.
+- For blocking findings, identify the violated invariant, caller/state path,
+  input, or missing test that makes the failure credible.
+- Do not turn preferences, vague code smells, or hypothetical redesigns into
+  findings. If evidence is insufficient, label it a `question` or omit it.
+- Prefer one precise finding over several overlapping weak findings.
+- Distinguish an actual defect from a suggestion for simplification or
+  elegance.
+- Never claim a test, lint command, or tool result was run unless it actually
+  was run.
 
 ## Finding format
 
@@ -58,6 +69,7 @@ Severity guidance:
 - `suggestion`: worthwhile improvement without a demonstrated blocking failure.
 - `question`: missing context needed to determine correctness.
 
-End with a verdict (`BLOCKING`, `SUGGESTIONS`, or `CLEAN`) and summarize test,
-lint, and other verification results. Never claim a command passed unless it
-was actually run.
+End with a verdict (`BLOCKING`, `SUGGESTIONS`, or `CLEAN`) and summarize the
+review boundary: changed files, important callers/paths inspected, and tests
+or lint actually run. A clean result should state what was checked, not merely
+say “no issues.”
