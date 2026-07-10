@@ -84,6 +84,10 @@ def _build_agent_cmd(
     if use_codex:
         combined = f"{system_prompt.rstrip()}\n\n---\n\n{initial_msg}"
         cmd = [CODEX_BIN]
+        # --add-dir is rejected under Codex's read-only default. Interactive
+        # arc sessions need to write in the sandbox and project vault.
+        if additional_dirs:
+            cmd += ["--sandbox", "workspace-write"]
         if model:
             cmd += ["-m", model]
         if cwd is not None:
@@ -2054,7 +2058,7 @@ def _run_thorough_review(
         cmd = ["codex"]
         if model:
             cmd += ["-m", model]
-        cmd += ["-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), synthesis_prompt]
+        cmd += ["--sandbox", "workspace-write", "-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), synthesis_prompt]
     else:
         cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
         if model:
@@ -2263,7 +2267,7 @@ def _run_review(
         cmd = ["codex"]
         if model:
             cmd += ["-m", model]
-        cmd += ["-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), review_prompt]
+        cmd += ["--sandbox", "workspace-write", "-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), review_prompt]
     else:
         cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
         if model:
@@ -3505,7 +3509,7 @@ def address_review(
         cmd = ["codex"]
         if model:
             cmd += ["-m", model]
-        cmd += ["-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), prompt]
+        cmd += ["--sandbox", "workspace-write", "-C", str(sandbox_path), "--add-dir", str(cfg.obsidian_vault), prompt]
     else:
         cmd = [CLAUDE_BIN, "--dangerously-skip-permissions"]
         if model:
