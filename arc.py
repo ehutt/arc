@@ -3967,6 +3967,53 @@ def _kill_sessions(proj: "Project") -> None:
         console.print(f"[dim]Killed implement session: {impl_sess}[/dim]")
 
 
+def _remove_project_sandbox(cfg: Config, proj: Project) -> bool:
+    """Remove a completed project's tracked sandbox when it is safe to target."""
+    if not proj.sandbox:
+        return True
+
+    sandbox_path = Path(proj.sandbox).expanduser()
+    if not sandbox_path.exists():
+        proj.sandbox = ""
+        return True
+
+    sandbox_root = cfg.sandbox_root.resolve()
+    resolved = sandbox_path.resolve()
+    safe = (
+        not sandbox_path.is_symlink()
+        and resolved.parent == sandbox_root
+        and resolved.name == proj.slug
+        and (resolved / ".git").exists()
+    )
+    if not safe:
+        console.print(
+            f"[yellow]Refusing to remove sandbox outside the expected location: "
+            f"{sandbox_path}[/yellow]"
+        )
+        return False
+
+    try:
+        shutil.rmtree(resolved)
+    except OSError as exc:
+        console.print(f"[yellow]Could not remove sandbox {resolved}: {exc}[/yellow]")
+        return False
+
+    proj.sandbox = ""
+    console.print(f"[dim]Removed sandbox: {resolved}[/dim]")
+    return True
+
+
+def _mark_project_done(cfg: Config, proj: Project) -> None:
+    """Close a project, stop its sessions, and discard its completed sandbox."""
+    _kill_sessions(proj)
+    _remove_project_sandbox(cfg, proj)
+    proj.status = "done"
+    proj.lifecycle = "frozen"
+    proj.dev_port = 0
+    proj.dev_session = ""
+    update_project_note(proj)
+
+
 @app.command(rich_help_panel="Project Management")
 def done(
     project: str = typer.Argument(autocompletion=complete_project),
@@ -3984,12 +4031,7 @@ def done(
             stage = active[0] if active else proj.next_available_stage()
             if stage is None:
                 # All stages done — mark the project itself as done
-                _kill_sessions(proj)
-                proj.status = "done"
-                proj.lifecycle = "frozen"
-                proj.dev_port = 0
-                proj.dev_session = ""
-                update_project_note(proj)
+                _mark_project_done(cfg, proj)
                 console.print(f"[green bold]All stages complete — {proj.slug} done.[/green bold]")
                 raise typer.Exit(0)
         else:
@@ -4017,12 +4059,7 @@ def done(
                 " to close the project.[/cyan]"
             )
     else:
-        _kill_sessions(proj)
-        proj.status = "done"
-        proj.lifecycle = "frozen"
-        proj.dev_port = 0
-        proj.dev_session = ""
-        update_project_note(proj)
+        _mark_project_done(cfg, proj)
         console.print(f"[green]{proj.slug} done.[/green]")
 
 

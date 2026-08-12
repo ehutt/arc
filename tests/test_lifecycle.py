@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,7 @@ import pytest
 import yaml
 
 import arc
+import cleanup as cleanup_script
 import organize
 
 
@@ -253,6 +255,129 @@ def test_refresh_legacy_project_sets_defaults(cfg: arc.Config, tmp_vault: Path, 
     fm = _read_fm(proj.path)
     assert fm["lifecycle"] == "live"
     assert fm["source_type"] == "project-meta"
+
+
+# ---------------------------------------------------------------------------
+# Sandbox lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _init_sandbox(path: Path) -> None:
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Arc Test"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "arc@example.test"], cwd=path, check=True)
+    (path / "tracked.txt").write_text("base\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "base"], cwd=path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "switch", "-c", "test/feature"], cwd=path, check=True, capture_output=True
+    )
+
+
+def test_done_removes_project_sandbox(
+    monkeypatch: pytest.MonkeyPatch, cfg: arc.Config
+) -> None:
+    proj = arc.find_project(cfg, "feat-a")
+    proj.stages = []
+    sandbox = cfg.sandbox_root / proj.slug
+    _init_sandbox(sandbox)
+    proj.sandbox = str(sandbox)
+    arc.update_project_note(proj)
+
+    _patch_load_config(monkeypatch, cfg)
+    monkeypatch.setattr(arc, "_kill_sessions", lambda _proj: None)
+    arc.done("feat-a", stage_id=None, skip=False)
+
+    assert not sandbox.exists()
+    fm = _read_fm(proj.path)
+    assert fm["status"] == "done"
+    assert fm["sandbox"] == ""
+
+
+def test_archive_preserves_project_sandbox(
+    monkeypatch: pytest.MonkeyPatch, cfg: arc.Config
+) -> None:
+    proj = arc.find_project(cfg, "feat-a")
+    sandbox = cfg.sandbox_root / proj.slug
+    _init_sandbox(sandbox)
+    proj.sandbox = str(sandbox)
+    arc.update_project_note(proj)
+
+    _patch_load_config(monkeypatch, cfg)
+    monkeypatch.setattr(arc, "_kill_sessions", lambda _proj: None)
+    arc.archive("feat-a")
+
+    assert sandbox.exists()
+    assert _read_fm(proj.path)["sandbox"] == str(sandbox)
+
+
+def test_cleanup_removes_clean_commit_free_done_sandbox(cfg: arc.Config) -> None:
+    sandbox = cfg.sandbox_root / "finished"
+    _init_sandbox(sandbox)
+
+    removed = cleanup_script._remove_disposable_sandbox(
+        status="done",
+        slug="finished",
+        sandbox=sandbox,
+        sandbox_root=cfg.sandbox_root,
+        dry_run=False,
+        logger=logging.getLogger("test-cleanup"),
+    )
+
+    assert removed
+    assert not sandbox.exists()
+
+
+@pytest.mark.parametrize("status", ["archived", "active"])
+def test_cleanup_preserves_non_done_sandbox(
+    cfg: arc.Config, status: str
+) -> None:
+    sandbox = cfg.sandbox_root / "preserved"
+    _init_sandbox(sandbox)
+
+    removed = cleanup_script._remove_disposable_sandbox(
+        status=status,
+        slug="preserved",
+        sandbox=sandbox,
+        sandbox_root=cfg.sandbox_root,
+        dry_run=False,
+        logger=logging.getLogger("test-cleanup"),
+    )
+
+    assert not removed
+    assert sandbox.exists()
+
+
+@pytest.mark.parametrize("kind", ["dirty", "committed"])
+def test_cleanup_preserves_done_sandbox_with_work(
+    cfg: arc.Config, kind: str
+) -> None:
+    sandbox = cfg.sandbox_root / "unfinished"
+    _init_sandbox(sandbox)
+    (sandbox / "tracked.txt").write_text(f"{kind}\n")
+    if kind == "committed":
+        subprocess.run(["git", "add", "tracked.txt"], cwd=sandbox, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "feature work"],
+            cwd=sandbox,
+            check=True,
+            capture_output=True,
+        )
+
+    removed = cleanup_script._remove_disposable_sandbox(
+        status="done",
+        slug="unfinished",
+        sandbox=sandbox,
+        sandbox_root=cfg.sandbox_root,
+        dry_run=False,
+        logger=logging.getLogger("test-cleanup"),
+    )
+
+    assert not removed
+    assert sandbox.exists()
 
 
 # ---------------------------------------------------------------------------

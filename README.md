@@ -92,8 +92,8 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc reconcile` | Reconcile vault state against sandbox git reality: branch, last_activity (latest commit), planned→active promotion, orphan-sandbox report. `--dry-run` to preview. Scheduled nightly via launchd. |
 | `arc note <slug>` | Open a project's Obsidian note |
 | `arc new <title>` | Create a new project note without a GitHub issue |
-| `arc done <slug> [stage]` | Mark a stage (or whole project) as done — auto-promotes next stages to `ready`. Use `--skip` to skip instead. |
-| `arc archive <slug>` | Shelve a project without completing it — kills sessions but preserves the sandbox for later. Use when pausing or abandoning work. |
+| `arc done <slug> [stage]` | Mark a stage (or whole project) as done — auto-promotes next stages to `ready`; closing the whole project stops sessions and removes its sandbox. Use `--skip` to skip instead. |
+| `arc archive <slug>` | Shelve a project without completing it — kills sessions and always preserves the sandbox for later. Use when pausing or abandoning work. |
 | **Planning** | |
 | `arc plan <slug>` | Interactive planning session (Claude by default; `--codex` for Codex) |
 | `arc stage <slug>` | List stages; `--add "name"` to add, `--depends-on 1,2` for deps, `--plan <id>` to plan a stage (`--codex` for Codex) |
@@ -116,7 +116,7 @@ Project slug autocompletion is built in via Typer — tab-complete works for all
 | `arc init` | Interactive setup — create `config.toml` from prompts |
 | `arc chat <slug>` | Informal chat with project context (Claude by default; `--codex` for Codex) |
 | `arc organize` | Run the vault organizer (tag & link notes) |
-| `arc cleanup` | Move done/archived project folders to vault archive (`--dry-run` to preview) |
+| `arc cleanup` | Remove clean, commit-free sandboxes for done projects, then move done/archived project folders to the vault archive (`--dry-run` to preview). Archived-project sandboxes are preserved. |
 
 ### Knowledge layer
 
@@ -455,7 +455,7 @@ These are optional — arc works without them. They just make it easier to track
 
 ### Weekly project cleanup
 
-`cleanup.py` runs independently as a uv inline script. It scans your Projects folder, finds any project with a `done` or `archived` status, and moves the entire project folder into `Projects/Archived/`.
+`cleanup.py` runs independently as a uv inline script. It scans your Projects folder, finds any project with a `done` or `archived` status, and moves the entire project folder into `Projects/Archived/`. Before archiving a `done` project, it removes the project's sandbox only when the worktree is clean and its branch has no commits ahead of `origin/main` (or local `main`). Sandboxes for `archived` projects are always preserved so they can be resumed later.
 
 **Manual run:**
 ```sh
