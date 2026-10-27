@@ -112,14 +112,14 @@ def get_api_key() -> str:
         return key
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-a", "vault-organize",
+            ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
              "-s", "ANTHROPIC_API_KEY", "-w"],
             capture_output=True, text=True, check=True,
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError:
         console.print("[red]API key not found. Set ANTHROPIC_API_KEY env var or run:[/red]")
-        console.print('  security add-generic-password -a "vault-organize" -s "ANTHROPIC_API_KEY" -w "sk-ant-..."')
+        console.print('  security add-generic-password -a "$USER" -s "ANTHROPIC_API_KEY" -w "sk-ant-..."')
         sys.exit(1)
 
 
