@@ -197,6 +197,8 @@ class Config:
     test_cmd: str
     lint_cmd: str
     dev_env_file: Path | None = None
+    dev_op_account: str | None = None
+    dev_op_environments: tuple[str, ...] = ()
 
     @property
     def projects_dir(self) -> Path:
@@ -214,7 +216,8 @@ def load_config() -> Config:
         raise typer.Exit(1)
     with open(config_path, "rb") as f:
         raw = tomllib.load(f)
-    dev_env_file_raw = raw.get("dev", {}).get("env_file")
+    dev_raw = raw.get("dev", {})
+    dev_env_file_raw = dev_raw.get("env_file")
     return Config(
         obsidian_vault=Path(raw["core"]["obsidian_vault"]).expanduser(),
         projects_folder=raw["core"]["projects_folder"],
@@ -225,6 +228,8 @@ def load_config() -> Config:
         test_cmd=raw["agent"]["test_cmd"],
         lint_cmd=raw["agent"]["lint_cmd"],
         dev_env_file=Path(dev_env_file_raw).expanduser() if dev_env_file_raw else None,
+        dev_op_account=dev_raw.get("op_account"),
+        dev_op_environments=tuple(dev_raw.get("op_environments", ())),
     )
 
 
@@ -3610,14 +3615,6 @@ MODEL_API_KEYS = [
     "KAGGLE_KEY",
 ]
 
-# Secrets made available to the Phoenix dev server. Values are resolved by the
-# launch script directly from macOS Keychain so they are never serialized into
-# the script or tmux's stored environment.
-DEV_API_KEYS = [
-    *MODEL_API_KEYS,
-    "PHOENIX_AGENTS_COLLECTOR_API_KEY",
-]
-
 # Phoenix cloud vars to unset for local dev
 PHOENIX_CLOUD_VARS = [
     "PHOENIX_HOST",
@@ -3690,6 +3687,13 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)) -> None:
 
     if cfg.dev_env_file is not None and not cfg.dev_env_file.is_file():
         console.print(f"[red]Configured dev env file not found: {cfg.dev_env_file}[/red]")
+        raise typer.Exit(1)
+
+    # Secrets come from 1Password Environments, injected by `op run` into the
+    # server process only, so their values never reach the script or tmux.
+    op_bin = shutil.which("op") if cfg.dev_op_environments else None
+    if cfg.dev_op_environments and op_bin is None:
+        console.print("[red]1Password CLI (op) not found; dev.op_environments needs it.[/red]")
         raise typer.Exit(1)
 
     # Unset cloud-targeting vars
@@ -3831,18 +3835,6 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)) -> None:
                 "set +a",
             ]
         )
-    dev_api_keys = " ".join(shlex.quote(key) for key in DEV_API_KEYS)
-    lines.extend(
-        [
-            f"for key in {dev_api_keys}; do",
-            '  if value="$(/usr/bin/security find-generic-password '
-            '-a "$USER" -s "$key" -w 2>/dev/null)"; then',
-            '    export "$key=$value"',
-            "  fi",
-            "done",
-            "unset key value",
-        ]
-    )
     for var in PHOENIX_CLOUD_VARS:
         lines.append(f"unset {var}")
     lines.append(f'export PHOENIX_WORKING_DIR="{Path.home() / ".phoenix"}"')
@@ -3854,7 +3846,15 @@ def dev(project: str = typer.Argument(autocompletion=complete_project)) -> None:
     lines.append(f"export DEBUGPY_PORT={debugpy_port}")
     lines.append(f"export VITE_PORT={vite_port}")
     lines.append(f"export PHOENIX_GRPC_PORT={grpc_port}")
-    lines.append(f'make -C "{sandbox_path}" dev 2>&1 | tee "{dev_log}"')
+    make_cmd = f'make -C "{sandbox_path}" dev'
+    if op_bin is not None:
+        op_args = [op_bin, "run"]
+        if cfg.dev_op_account:
+            op_args += ["--account", cfg.dev_op_account]
+        for env_id in cfg.dev_op_environments:
+            op_args += ["--environment", env_id]
+        make_cmd = f"{shlex.join(op_args)} -- {make_cmd}"
+    lines.append(f'{make_cmd} 2>&1 | tee "{dev_log}"')
     dev_script.write_text("\n".join(lines) + "\n")
     dev_script.chmod(0o755)
 

@@ -216,16 +216,23 @@ model = "claude-sonnet-4-20250514"
 
 The `arc dev` command launches a dev server in tmux. By default it runs `make dev` in the sandbox. To customize:
 
-Set `dev.env_file` in `config.toml` to source a canonical environment file
-before every launch. When configured, `arc dev` refuses to start if the file
-does not exist. Keep this file limited to non-secret application configuration.
-At runtime, `arc dev` retrieves its API keys directly from macOS Keychain so
-their values are not written into the launch script.
+Set `dev.op_environments` in `config.toml` to the IDs of the 1Password
+Environments the dev server needs. `arc dev` wraps the launch command in
+`op run --environment <id> ...`, so secrets are injected into the server process
+only and never written into the launch script or tmux's stored environment.
+When the same variable appears in more than one Environment, the last one wins.
+`dev.op_account` selects the 1Password account. The first launch after
+1Password locks asks for approval in the 1Password app.
 
 ```toml
 [dev]
-env_file = "~/Projects/phoenix/.env"
+op_account = "my.1password.com"
+op_environments = ["<local-phoenix-id>", "<model-keys-id>"]
 ```
+
+Optionally, set `dev.env_file` to source a file of non-secret configuration
+before launch. When configured, `arc dev` refuses to start if the file does not
+exist. 1Password values take precedence over it.
 
 1. **Change the launch command**: In `arc.py`, find the `dev_script` construction (search for `exec make`). Replace the last line with your app's dev server command (e.g. `exec npm run dev`, `exec cargo run`, etc.).
 2. **Change the default port**: The default port is `6006`. Change to whatever your dev server uses.
@@ -235,9 +242,9 @@ env_file = "~/Projects/phoenix/.env"
 
 arc injects env vars into agent subprocesses in two ways:
 
-1. **`MODEL_API_KEYS` and `DEV_API_KEYS` lists**: API keys carried into agent subprocesses and Phoenix dev-server processes. `arc dev` resolves `DEV_API_KEYS` from Keychain at launch time without serializing their values into its script. Add or remove keys as needed for your setup.
+1. **`MODEL_API_KEYS` list**: API keys carried into agent subprocesses. Add or remove keys as needed for your setup. The Phoenix dev server doesn't use this list; `arc dev` gets its keys from `dev.op_environments`.
 
-2. **`_load_env_keys()` function**: Loads each key from the **macOS Keychain** first (`security find-generic-password -a $USER -s <KEY> -w`), falling back to a `.env` file at `cfg.sandbox_root.parent / "phoenix" / ".env"` for any key not in the Keychain. Store keys with `security add-generic-password -a "$USER" -s <KEY> -w`. Agent sessions use this loader; `arc dev` sources its configured `dev.env_file` and independently resolves `DEV_API_KEYS` from Keychain inside the server launch process.
+2. **`_load_env_keys()` function**: Loads each key from the **macOS Keychain** first (`security find-generic-password -a $USER -s <KEY> -w`), falling back to a `.env` file at `cfg.sandbox_root.parent / "phoenix" / ".env"` for any key not in the Keychain. Store keys with `security add-generic-password -a "$USER" -s <KEY> -w`. Agent sessions use this loader; `arc dev` doesn't.
 
 > **Subscription billing guard**: `ANTHROPIC_API_KEY` is always stripped from Claude Code launches (interactive and background) via `_clean_env("claude")` — its presence would silently switch Claude Code from subscription (OAuth) billing to pay-per-token API billing. Codex sessions and non-Claude subprocesses still receive it for code under test. Agents inside a Claude session that need the key can fetch it on demand from the Keychain.
 
