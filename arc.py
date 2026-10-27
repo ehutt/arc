@@ -4321,7 +4321,7 @@ def _get_anthropic_key() -> str:
     try:
         r = subprocess.run(
             ["security", "find-generic-password",
-             "-a", "vault-organize", "-s", "ANTHROPIC_API_KEY", "-w"],
+             "-a", os.environ.get("USER", ""), "-s", "ANTHROPIC_API_KEY", "-w"],
             capture_output=True, text=True, check=True,
         )
         return r.stdout.strip()
